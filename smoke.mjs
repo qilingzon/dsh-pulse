@@ -71,6 +71,7 @@ ok(el.children[0].children[0] === "缓存命中 87.43%", `缓存命中 pill = ${
 ok(el.children[1].children[0] === "— tok/s", `无采样时速度 pill = ${JSON.stringify(el.children[1].children[0])}`);
 ok(el.props["data-pulse"] === "87.43", `data-pulse = ${el.props["data-pulse"]}`);
 ok(el.props["data-pulse-tps"] === "idle", `data-pulse-tps = ${el.props["data-pulse-tps"]}`);
+ok(el.props["data-pulse-chars"] === "0" && el.props["data-pulse-units"] === "0", "chars/units 探针初始为 0");
 
 // ---- 3. 无缓存数据 + 无速度 → 整条 dock 不渲染（不留空 pill） ----
 const bare = T.PulseDock({ t: seatMiss, useProjection: () => undefined, useChat: () => null });

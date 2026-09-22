@@ -161,6 +161,7 @@ ok(/props\.useChat/.test(src) && /legacy\.partial/.test(src), "读 legacy.partia
 ok(/setInterval\(/.test(src) && /clearInterval\(/.test(src), "采样循环随卸载清理（不泄漏定时器）");
 ok(/"data-pulse-tps"/.test(src), "速度读数带 data-pulse-tps 探针");
 ok(/"data-pulse-exact"/.test(src) && /"data-pulse-est"/.test(src), "暴露 exact / est 只读探针（供外部实测对照，不改显示逻辑）");
+ok(/"data-pulse-chars"/.test(src) && /"data-pulse-units"/.test(src), "暴露 chars / units 加权探针（实机实测用，只读）");
 ok(/window\.__ModuleLoader__\.load\(\{\s*\n\s*id: "dsh-pulse"/.test(src), "ModuleLoader id = dsh-pulse");
 ok(/require\("react"\)/.test(src), 'require("react")');
 ok(/exports\.inject = inject/.test(src) && /exports\.apply = apply/.test(src), "导出 inject / apply");

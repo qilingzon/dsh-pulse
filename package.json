@@ -21,6 +21,7 @@
     "bench.mjs",
     "HARNESS_PLUGIN.md",
     "README.md",
+    "TEST_COVERAGE.md",
     "LICENSE"
   ],
   "keywords": [

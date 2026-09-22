@@ -181,7 +181,7 @@ npm run harness:test   # verify + smoke 都跑
 VERIFY-OK（全部断言通过）
 ```
 
-### `smoke.mjs`（实测，EXIT=0，22 条断言全 PASS）
+### `smoke.mjs`（实测，EXIT=0，23 条断言全 PASS）
 
 真装载 `client.js`（走 `window.__ModuleLoader__.load`），用假 React 渲染 `PulseDock`：
 
@@ -223,11 +223,11 @@ SMOKE-OK（组件层全部通过）
   其余状态：ratio / running / stepStartTokens / stepPeakChars / estTokens / renderedKey —— 6 个标量
 
 === 4. 发布体积 ===
-  client.js  23011 B → gzip 7849 B
+  client.js  26250 B → gzip 8996 B
   index.js     769 B → gzip  616 B
   cordis.patch.yml 48 B → gzip 60 B
-  package.json 1569 B → gzip 766 B
-  合计       25397 B → gzip 9291 B (9.1 KiB)
+  package.json 1707 B → gzip 825 B
+  合计       28774 B → gzip 10497 B (10.3 KiB)
 ```
 
 **四条让它轻的硬约束：**
@@ -281,8 +281,8 @@ SMOKE-OK（组件层全部通过）
 |---|---|---|
 | 每拍 0.21–0.22 µs | `process.hrtime`，20 万次平均，满窗 41 点 | 测的是**纯算术**，**不含** React 渲染成本 |
 | 缓冲恒 41 点 | 20 万拍后复查 `samples.length` | 与平台无关，可靠 |
-| gzip 9.1 KiB | `zlib.gzipSync(level:9)` | 可靠 |
-| 63 + 22 条断言全 PASS | `verify.mjs` / `smoke.mjs` | 断言本身可信；但 smoke 用的是**假 React** |
+| gzip 10.3 KiB | `zlib.gzipSync(level:9)` | 可靠 |
+| 73 + 23 条断言全 PASS | `verify.mjs` / `smoke.mjs` | 断言本身可信；但 smoke 用的是**假 React** |
 | 0.000043% 单核 | 由上两条折算 | **只算采样算术**，不含渲染 |
 
 > 诚实备注：`bench.mjs` 初版把时间步长写成 1 ms/拍，导致环形缓冲不裁剪、测出「95.58 µs / 20001 点」的退化值。修正为真实 500 ms/拍后才是上面的数字。README 里从未出现过那组错值。

@@ -11,8 +11,8 @@
 - `index.js`（宿主半部）—— **故意为空**：本插件没有宿主侧贡献（不注入提示词、不注册服务、不落盘）。
 - `cordis.patch.yml` —— bundle 行：`insert: [{ id: pulse, name: dsh-pulse }]`。
 - `verify.mjs` —— 语法 + formatter 行为断言 + 10 秒滑窗算术 + 注册面静态核对（72 条）。
-- `smoke.mjs` —— 组件层冒烟：真装载 `client.js`，假 React 下渲染 `PulseDock`（22 条）。
-- `bench.mjs` —— 性能实测：每拍开销 / 常驻内存 / 发布体积。
+- `smoke.mjs` —— 组件层冒烟：真装载 `client.js`，假 React 下渲染 `PulseDock`（23 条）。
+- `bench.mjs` —— 性能实测：每拍开销 / 常驻内存 / 发布体积。\n- `TEST_COVERAGE.md` —— 测试覆盖矩阵：六层测试的覆盖/边界/未测项（回答「全面吗」以此为准）。
 - `install.sh` / `install.ps1` —— Linux 与 Windows 两套等价安装器（三处解析位 + profile 注册 + 备份 + 回读 + JSON 回滚）。
 
 ## 不改变什么
