@@ -10,7 +10,7 @@
      流式进行中宿主没有 usage，改走 `useChat(s => s.legacy.partial)` 的实时文本增量 × 自标定 `chars/token`，带 `~` 前缀。
 - `index.js`（宿主半部）—— **故意为空**：本插件没有宿主侧贡献（不注入提示词、不注册服务、不落盘）。
 - `cordis.patch.yml` —— bundle 行：`insert: [{ id: pulse, name: dsh-pulse }]`。
-- `verify.mjs` —— 语法 + formatter 行为断言 + 10 秒滑窗算术 + 注册面静态核对（63 条）。
+- `verify.mjs` —— 语法 + formatter 行为断言 + 10 秒滑窗算术 + 注册面静态核对（72 条）。
 - `smoke.mjs` —— 组件层冒烟：真装载 `client.js`，假 React 下渲染 `PulseDock`（22 条）。
 - `bench.mjs` —— 性能实测：每拍开销 / 常驻内存 / 发布体积。
 - `install.sh` / `install.ps1` —— Linux 与 Windows 两套等价安装器（三处解析位 + profile 注册 + 备份 + 回读 + JSON 回滚）。
@@ -27,13 +27,13 @@
 | 项 | 值 |
 |---|---|
 | 包名 / `dsh.id` | `dsh-pulse`（**name == 注册 id**，规避 B23） |
-| 版本 | `0.3.1` |
+| 版本 | `0.4.0` |
 | 平台 | `client.platform: web`，`immediately: true` |
 | 依赖 | 仅 `react`（由 `require("react")` 从宿主取） |
 | 注入 | `slots`、`locale` |
 | 座位 | `conversation.composer.dock` / `pulse` / order `1` / locale `ui-pulse` |
 | 读取的 slot props | `t`、`useProjection`、`useChat`（均为该 slot 契约内声明提供的标准工具包） |
-| 滑窗参数 | `WINDOW_MS = 10000`、`SAMPLE_MS = 500`、`MIN_SPAN_MS = 1000`、`RATIO ∈ [0.05, 8]` |
+| 滑窗参数 | `WINDOW_MS = 10000`、`SAMPLE_MS = 500`、`MIN_SPAN_MS = 1000`、`RATIO ∈ [0.05, 8]`、种子 `0.80 tok/unit`（实机实测） |
 | 运行位置 | 采样循环在**浏览器**（客户端插件）；宿主侧 `index.js` 空实现 → VPS 进程零增量 |
 | 实测开销 | 0.22 µs/拍 × 2 拍/秒 = 0.000043% 单核；常驻 ≈ 1 KiB；gzip 9.1 KiB |
 

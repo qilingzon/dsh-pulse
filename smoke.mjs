@@ -90,7 +90,7 @@ const estRate = T.readRate(mk(true), 5000, true, seatMiss);
 ok(estRate.text === "~180 tok/s", `流式估算文案 = ${JSON.stringify(estRate.text)}`);
 ok(estRate.key === "180", `data-pulse-tps = ${estRate.key}`);
 ok(/流式进行中/.test(estRate.title), "估算态 title 明示「流式进行中」");
-ok(/1\.2 chars\/token/.test(estRate.title), "估算态 title 带标定比");
+ok(/1\.2 tok\/unit/.test(estRate.title), "估算态 title 带标定比（tok/unit 加权口径）");
 
 const exRate = T.readRate(mk(false), 5000, false, seatMiss);
 ok(exRate.text === "150 tok/s", `结算后精确文案 = ${JSON.stringify(exRate.text)}（不带 ~）`);
@@ -138,8 +138,10 @@ mod2.__test.PulseDock(streamingProps);
 intervalFn();
 const el3 = mod2.__test.PulseDock(streamingProps);
 ok(before === "idle", `首帧还没采到两点 → ${before}`);
-ok(el3.props["data-pulse-tps"] === "100", `两拍（0s/2s，100→500 字符）→ 200 估算 tok / 2s = 100 tok/s，实得 ${el3.props["data-pulse-tps"]}`);
-ok(el3.children[1].children[0] === "~100 tok/s", `流式 pill 带 ~ 前缀：${JSON.stringify(el3.children[1].children[0])}`);
+// 加权口径：ASCII 100→500 字 = 42→210 unit；est = 600 + unit × 0.80 → 633.6 → 768
+// 10 秒窗内斜率 = (768 − 633.6) / 2s = 67.2 → 67 tok/s
+ok(el3.props["data-pulse-tps"] === "67", `两拍（0s/2s，100→500 ASCII 字）→ 67.2 tok/s，实得 ${el3.props["data-pulse-tps"]}`);
+ok(el3.children[1].children[0] === "~67 tok/s", `流式 pill 带 ~ 前缀：${JSON.stringify(el3.children[1].children[0])}`);
 
 console.log("");
 console.log(fail === 0 ? "SMOKE-OK（组件层全部通过）" : `SMOKE-FAILED（${fail} 项不通过）`);

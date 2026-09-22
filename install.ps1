@@ -1,4 +1,4 @@
-# install.ps1 — dsh-pulse 部署（三处解析位 + profile 注册；幂等，自动备份，逐字节回读）
+﻿# install.ps1 — dsh-pulse 部署（三处解析位 + profile 注册；幂等，自动备份，逐字节回读）
 #
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -DshHome "C:\Users\you\.dsh" -Profiles web

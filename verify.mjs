@@ -67,9 +67,9 @@ console.log("=== 3. 10 秒滑窗速率（抽取 window 区做行为断言） ===
     const region = src.slice(ws, we);
     const w = new Function(
       region +
-        "\nreturn { createMeterState, stepMeter, pushSample, windowSlope, formatRate, displayKey, calibrateRatio, estimateTokens, liveChars, exactOutputTokens };"
+        "\nreturn { createMeterState, stepMeter, pushSample, windowSlope, formatRate, displayKey, calibrateRatio, estimateTokens, liveChars, liveUnits, exactOutputTokens };"
     )();
-    const { createMeterState, stepMeter, pushSample, windowSlope, formatRate, displayKey, calibrateRatio, estimateTokens, liveChars, exactOutputTokens } = w;
+    const { createMeterState, stepMeter, pushSample, windowSlope, formatRate, displayKey, calibrateRatio, estimateTokens, liveChars, liveUnits, exactOutputTokens } = w;
 
     ok(liveChars(null) === 0, "liveChars(null) = 0（不崩）");
     ok(liveChars({ blocks: [] }) === 0, "liveChars(空 blocks) = 0");
@@ -94,7 +94,14 @@ console.log("=== 3. 10 秒滑窗速率（抽取 window 区做行为断言） ===
     ok(calibrateRatio(1000, 20000, 0.5) === 8, "过大比值夹紧到上界 8");
 
     ok(estimateTokens(100, 200, 0.5) === 200, "estimateTokens(100, 200, 0.5) = 200");
-    ok(estimateTokens(0, 100, 0) === 50, "ratio 为 0 → 退回种子比 0.5，得 50");
+    ok(estimateTokens(0, 100, 0) === 80, "ratio 为 0 → 退回种子比 0.80（三次实机实测），得 80");
+
+    // liveUnits：语言加权（CJK = 1，非 CJK = 0.42），让一套种子比同时覆盖中英
+    ok(liveUnits(null) === 0, "liveUnits(null) = 0");
+    ok(liveUnits({ blocks: [{ kind: "text", text: "中文中文" }] }) === 4, "liveUnits 纯中文 4 字 = 4 unit");
+    ok(Math.abs(liveUnits({ blocks: [{ kind: "text", text: "abcd" }] }) - 1.68) < 1e-9, "liveUnits 纯英文 4 字 = 4 × 0.42 = 1.68 unit");
+    ok(liveUnits({ blocks: [{ kind: "tool-call", argsRaw: "xxxxxx" }] }) === 0, "liveUnits 不数 tool-call 参数");
+    ok(liveChars({ blocks: [{ kind: "text", text: "abcd" }] }) === 4, "liveChars 仍返回原始字符数（加权前的口径保留）");
 
     const s = [];
     for (let i = 0; i <= 10; i += 1) pushSample(s, i * 1000, i, i, 5000);
@@ -118,11 +125,14 @@ console.log("=== 3. 10 秒滑窗速率（抽取 window 区做行为断言） ===
     stepMeter(m, 2000, 0, 200, true);
     stepMeter(m, 3000, 0, 500, true);
     ok(m.running === true, "流式进行中 running = true");
-    ok(m.estTokens === 250, "估算值 = 0 + 500 字符 × 0.5 = 250");
+    ok(m.estTokens === 400, "估算值 = 0 + 500 unit × 0.80 = 400");
     stepMeter(m, 4000, 600, 0, false);
-    ok(m.ratio === 1.2, "步骤结算 → 标定比 = 600 tokens / 500 字符 = 1.2");
+    ok(m.ratio === 1.2, "步骤结算 → 标定比 = 600 tok / 500 unit = 1.2");
     ok(m.estTokens === 600, "结算后估算收敛回精确值 600（不跳变）");
     ok(m.running === false, "结算后 running = false");
+    ok(m.samples.length === 4, "结算不清窗：4 个采样点全留（曲线保持连续，exact 线不会变瞎）");
+    ok(Math.abs(m.samples[2].est - 600) < 1e-9, "等比回填：本步最后一条估算被对齐到实测 600（消除结算假尖峰）");
+    ok(m.samples[0].est === 0, "等比回填：本步起点仍为 0（只改量级，不改形状）");
     stepMeter(m, 5000, 600, 100, true);
     ok(m.estTokens === 720, "第二步用新比：600 + 100 × 1.2 = 720");
     const estSlope = windowSlope(m.samples, 5000, "est", 10000, 1000);
@@ -150,6 +160,7 @@ ok(/readProjection\(props\.useProjection, "sessionStats"\)/.test(src), "读 sess
 ok(/props\.useChat/.test(src) && /legacy\.partial/.test(src), "读 legacy.partial（流式进行中宿主没有 usage，只有这份实时文本）");
 ok(/setInterval\(/.test(src) && /clearInterval\(/.test(src), "采样循环随卸载清理（不泄漏定时器）");
 ok(/"data-pulse-tps"/.test(src), "速度读数带 data-pulse-tps 探针");
+ok(/"data-pulse-exact"/.test(src) && /"data-pulse-est"/.test(src), "暴露 exact / est 只读探针（供外部实测对照，不改显示逻辑）");
 ok(/window\.__ModuleLoader__\.load\(\{\s*\n\s*id: "dsh-pulse"/.test(src), "ModuleLoader id = dsh-pulse");
 ok(/require\("react"\)/.test(src), 'require("react")');
 ok(/exports\.inject = inject/.test(src) && /exports\.apply = apply/.test(src), "导出 inject / apply");

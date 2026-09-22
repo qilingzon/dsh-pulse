@@ -1,4 +1,4 @@
-# uninstall.ps1 — dsh-pulse 卸载（等价于 install.ps1 -Remove）
+﻿# uninstall.ps1 — dsh-pulse 卸载（等价于 install.ps1 -Remove）
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File uninstall.ps1 -DshHome "C:\Users\you\.dsh" -Profiles web
 param(

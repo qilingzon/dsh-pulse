@@ -89,9 +89,15 @@ window.__ModuleLoader__.load({
     var SAMPLE_MS = 500;     // 采样间隔
     var MIN_SPAN_MS = 1000;  // 跨度不足 1s 不出数（两点斜率不可信）
     var RETAIN_MS = WINDOW_MS * 2; // 环形缓冲保留两倍窗长，够取窗沿锚点
-    var RATIO_MIN = 0.05;    // chars/token 标定下界
-    var RATIO_MAX = 8;       // chars/token 标定上界
-    var RATIO_SEED = 0.5;    // 未标定前的兜底：2 chars/token（中英混排经验值）
+    var RATIO_MIN = 0.05;    // tok/unit 标定下界
+    var RATIO_MAX = 8;       // tok/unit 标定上界
+    var NON_CJK_WEIGHT = 0.42; // 非 CJK 字符折成多少 unit（1 CJK 字符 = 1 unit）
+    var CJK_RE = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\u3040-\u30FF\uAC00-\uD7AF]/;
+    // 未标定前的种子比（tok / unit）。加权口径让同一套比同时适配中英：
+    // 纯中文 ≈ 0.80 tok/char，纯英文 ≈ 0.34 tok/char。
+    // 2026-09-22 实机实测（gen4-lab 真实 DSH web，三次独立长/中/短回答，产品权威值对照）：
+    // 真实比 0.801 / 0.824 / 0.799 tok/unit —— 种子 0.80 与之相差 -0.1% ~ -2.9%（旧种子 0.5 相差 -23.9%）。
+    var RATIO_SEED = 0.80;
 
     function nonNeg(value) {
       return typeof value === "number" && isFinite(value) && value >= 0 ? value : 0;
@@ -146,19 +152,19 @@ window.__ModuleLoader__.load({
       return (streaming ? "~" : "") + rate;
     }
 
-    /** 标定 chars/token：步骤结算后用「本步精确 tokens ÷ 本步字符数」重算，越界则保持旧值。 */
-    function calibrateRatio(chars, tokens, previous) {
-      if (!(chars > 0) || !(tokens > 0)) return previous;
-      var ratio = tokens / chars;
+    /** 标定比（tok / unit）：步骤结算后用「本步精确 tokens ÷ 本步加权字符数」重算，越界则保持旧值。 */
+    function calibrateRatio(units, tokens, previous) {
+      if (!(units > 0) || !(tokens > 0)) return previous;
+      var ratio = tokens / units;
       if (!isFinite(ratio) || ratio <= 0) return previous;
       if (ratio < RATIO_MIN) return RATIO_MIN;
       if (ratio > RATIO_MAX) return RATIO_MAX;
       return ratio;
     }
 
-    /** 估算累计输出 tokens = 本步起点精确值 + 本步实时字符数 × 标定比。 */
-    function estimateTokens(stepStartTokens, chars, ratio) {
-      return nonNeg(stepStartTokens) + nonNeg(chars) * (ratio > 0 ? ratio : RATIO_SEED);
+    /** 估算累计输出 tokens = 本步起点精确值 + 本步实时加权字符数 × 标定比。 */
+    function estimateTokens(stepStartTokens, units, ratio) {
+      return nonNeg(stepStartTokens) + nonNeg(units) * (ratio > 0 ? ratio : RATIO_SEED);
     }
 
     /** 从 legacy.partial 的 blocks 里数正文字符（text + reasoning），不数工具调用参数。 */
@@ -174,6 +180,29 @@ window.__ModuleLoader__.load({
         if (typeof block.text === "string") total += block.text.length;
       }
       return total;
+    }
+
+    /**
+     * 加权字符数：CJK 字符记 1 unit，非 CJK 字符记 NON_CJK_WEIGHT。
+     * 同一个 tokenizer 下中文约 1.5 字符/token、英文约 4 字符/token，
+     * 用加权口径后一套种子比就能同时覆盖两种语言，不必按语言分支。
+     */
+    function liveUnits(partial) {
+      if (partial === null || typeof partial !== "object") return 0;
+      var blocks = partial.blocks;
+      if (!blocks || typeof blocks.length !== "number") return 0;
+      var units = 0;
+      for (var i = 0; i < blocks.length; i += 1) {
+        var block = blocks[i];
+        if (block === null || typeof block !== "object") continue;
+        if (block.kind !== "text" && block.kind !== "reasoning") continue;
+        if (typeof block.text !== "string") continue;
+        var text = block.text;
+        for (var j = 0; j < text.length; j += 1) {
+          units += CJK_RE.test(text.charAt(j)) ? 1 : NON_CJK_WEIGHT;
+        }
+      }
+      return units;
     }
 
     /** 精确累计输出 tokens：sessionStats.decodeTokens 优先，tokenUsage.outputTokens 兜底。 */
@@ -194,9 +223,12 @@ window.__ModuleLoader__.load({
         ratio: RATIO_SEED,
         running: false,
         stepStartTokens: 0,
-        stepPeakChars: 0,
+        stepPeakUnits: 0,
         estTokens: 0,
         lastNow: 0,
+        lastExact: null,
+        lastChars: 0,
+        lastUnits: 0,
         renderedKey: "",
         sessionStats: undefined,
         usage: undefined,
@@ -207,32 +239,49 @@ window.__ModuleLoader__.load({
     /**
      * 推进一个采样点：维护步骤沿、标定比与估算累计值。
      * 步骤开始 → 记下起点精确 tokens；步骤进行中 → 估算值随字符数增长；
-     * 步骤结算 → 用「本步精确 tokens ÷ 本步字符数」重标 ratio，估算值收敛回精确值。
+     * 步骤结算 → 重标 ratio，并按本步实测 token 数等比回填本步的估算曲线。
      * @param state - createMeterState() 的对象（原地改，返回同一对象）。
      * @param now - 墙钟毫秒。
      * @param exact - 精确累计输出 tokens；null 表示两个投影都不可用。
-     * @param chars - 当前在飞步骤的实时正文字符数。
+     * @param units - 当前在飞步骤的实时加权字符数。
      * @param running - 是否处于流式进行中。
      */
-    function stepMeter(state, now, exact, chars, running) {
+    function stepMeter(state, now, exact, units, running) {
       if (running && !state.running) {
         state.running = true;
-        state.stepPeakChars = 0;
+        state.stepPeakUnits = 0;
+        state.stepStartTime = now;
         state.stepStartTokens = exact === null ? 0 : exact;
       }
       if (running) {
-        if (chars > state.stepPeakChars) state.stepPeakChars = chars;
-        state.estTokens = estimateTokens(state.stepStartTokens, chars, state.ratio);
+        if (units > state.stepPeakUnits) state.stepPeakUnits = units;
+        state.estTokens = estimateTokens(state.stepStartTokens, units, state.ratio);
       } else {
         if (state.running) {
           state.running = false;
           var settled = exact === null ? 0 : exact;
-          state.ratio = calibrateRatio(state.stepPeakChars, settled - state.stepStartTokens, state.ratio);
-          state.stepPeakChars = 0;
+          var produced = settled - state.stepStartTokens;
+          var estimated = state.estTokens - state.stepStartTokens;
+          state.ratio = calibrateRatio(state.stepPeakUnits, produced, state.ratio);
+          // 结算是一次性上报，不是瞬时吞吐。若把跳变直接喂进采样流，10 秒窗会把整步的
+          // token 算成 ~1000 tok/s 并持续一整个窗口（2026-09-22 实机抓到 1115 tok/s）。
+          // 这里按本步实测 token 数对本步估算曲线做等比回填：形状仍来自文本增长，
+          // 量级对齐产品权威值 —— 曲线连续、无假尖峰，这一步在窗里显示的是真实平均速率。
+          if (produced > 0 && estimated > 0) {
+            var k = produced / estimated;
+            for (var si = 0; si < state.samples.length; si += 1) {
+              var smp = state.samples[si];
+              if (smp.t >= state.stepStartTime) {
+                smp.est = state.stepStartTokens + (smp.est - state.stepStartTokens) * k;
+              }
+            }
+          }
+          state.stepPeakUnits = 0;
         }
         state.estTokens = exact === null ? 0 : exact;
       }
       if (exact !== null) pushSample(state.samples, now, exact, state.estTokens, RETAIN_MS);
+      state.lastExact = exact;
       state.lastNow = now;
       return state;
     }
@@ -245,7 +294,7 @@ window.__ModuleLoader__.load({
       "tps.pillEst": "~{tps} tok/s",
       "tps.idle": "— tok/s",
       "tps.title": "近 {window} 秒平均输出速度 {tps} tok/s ｜ 窗口内输出 {tokens} tok ｜ 实测跨度 {span}s ｜ 采样 {points} 点 ｜ 口径：精确（sessionStats.decodeTokens 的墙钟斜率）",
-      "tps.titleEst": "近 {window} 秒平均输出速度约 {tps} tok/s（流式进行中，宿主尚未上报 usage）｜ 窗口内估算输出 {tokens} tok ｜ 实测跨度 {span}s ｜ 采样 {points} 点 ｜ 折算比 {ratio} chars/token，由上一次步骤结算时标定",
+      "tps.titleEst": "近 {window} 秒平均输出速度约 {tps} tok/s（流式进行中，宿主尚未上报 usage）｜ 窗口内估算输出 {tokens} tok ｜ 实测跨度 {span}s ｜ 采样 {points} 点 ｜ 折算比 {ratio} tok/unit（加权字符），由上一次步骤结算时标定",
       "tps.titleIdle": "近 {window} 秒无输出（会话空闲，或刚进入流式还没采到两点）"
     };
     var EN = {
@@ -255,7 +304,7 @@ window.__ModuleLoader__.load({
       "tps.pillEst": "~{tps} tok/s",
       "tps.idle": "— tok/s",
       "tps.title": "Output speed over the last {window}s: {tps} tok/s | {tokens} tok in window | measured span {span}s | {points} samples | exact (wall-clock slope of sessionStats.decodeTokens)",
-      "tps.titleEst": "Output speed over the last {window}s: about {tps} tok/s (streaming; usage not reported yet) | ~{tokens} tok in window | measured span {span}s | {points} samples | {ratio} chars/token, calibrated at the previous step settle",
+      "tps.titleEst": "Output speed over the last {window}s: about {tps} tok/s (streaming; usage not reported yet) | ~{tokens} tok in window | measured span {span}s | {points} samples | {ratio} tok/unit (weighted chars), calibrated at the previous step settle",
       "tps.titleIdle": "No output in the last {window}s (idle, or fewer than two samples since streaming began)"
     };
 
@@ -395,7 +444,7 @@ window.__ModuleLoader__.load({
               running ? "tps.titleEst" : "tps.title",
               params,
               running
-                ? "近 {window} 秒平均输出速度约 {tps} tok/s（流式进行中，宿主尚未上报 usage）｜ 窗口内估算输出 {tokens} tok ｜ 实测跨度 {span}s ｜ 采样 {points} 点 ｜ 折算比 {ratio} chars/token，由上一次步骤结算时标定"
+                ? "近 {window} 秒平均输出速度约 {tps} tok/s（流式进行中，宿主尚未上报 usage）｜ 窗口内估算输出 {tokens} tok ｜ 实测跨度 {span}s ｜ 采样 {points} 点 ｜ 折算比 {ratio} tok/unit（加权字符），由上一次步骤结算时标定"
                 : "近 {window} 秒平均输出速度 {tps} tok/s ｜ 窗口内输出 {tokens} tok ｜ 实测跨度 {span}s ｜ 采样 {points} 点 ｜ 口径：精确（sessionStats.decodeTokens 的墙钟斜率）"
             )
           };
@@ -432,7 +481,10 @@ window.__ModuleLoader__.load({
           var now = Date.now();
           var exact = exactOutputTokens(state.sessionStats, state.usage);
           var streaming = state.partial !== null && state.partial !== undefined;
-          stepMeter(state, now, exact, liveChars(state.partial), streaming);
+          var unitsNow = liveUnits(state.partial);
+          state.lastChars = liveChars(state.partial);
+          state.lastUnits = unitsNow;
+          stepMeter(state, now, exact, unitsNow, streaming);
           // 值没变就不重渲：空闲时采样照跑（窗要滑动），但一帧都不出。
           var next = displayKey(state, now, streaming);
           if (next !== state.renderedKey) {
@@ -493,7 +545,12 @@ window.__ModuleLoader__.load({
         {
           style: ANCHOR_STYLE,
           "data-pulse": view === null ? "na" : view.percent,
-          "data-pulse-tps": rate.key
+          "data-pulse-tps": rate.key,
+          // 只读探针：暴露两枚计数器的当前值，供外部实测与断言使用（不影响任何显示逻辑）。
+          "data-pulse-exact": meter.lastExact === null || meter.lastExact === undefined ? "na" : String(meter.lastExact),
+          "data-pulse-est": String(Math.round(meter.estTokens)),
+          "data-pulse-chars": String(meter.lastChars),
+          "data-pulse-units": String(Math.round(meter.lastUnits))
         },
         children
       );
@@ -531,6 +588,7 @@ window.__ModuleLoader__.load({
       calibrateRatio: calibrateRatio,
       estimateTokens: estimateTokens,
       liveChars: liveChars,
+      liveUnits: liveUnits,
       exactOutputTokens: exactOutputTokens,
       readRate: readRate,
       PulseDock: PulseDock
