@@ -1,0 +1,23 @@
+# deps / build
+node_modules/
+pnpm-lock.yaml
+package-lock.json
+yarn.lock
+
+# local install scratch
+*.bak
+*.bak-*
+*.bak.*
+.backups/
+logs/
+*.log
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# DSH runtime artifacts
+.dsh-module-fallback/
+.dsh-market/

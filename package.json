@@ -1,0 +1,58 @@
+{
+  "name": "dsh-pulse",
+  "version": "0.1.0",
+  "description": "客户端插件：在 composer dock 增加一枚「缓存命中 99.87%」两位小数读数（含精确 token 明细）。只读投影，不改宿主。",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "install.ps1",
+    "uninstall.ps1",
+    "verify.mjs",
+    "HARNESS_PLUGIN.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cache-hit",
+    "token-usage",
+    "composer-dock"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qilingzon/dsh-pulse.git"
+  },
+  "homepage": "https://github.com/qilingzon/dsh-pulse#readme",
+  "bugs": {
+    "url": "https://github.com/qilingzon/dsh-pulse/issues"
+  },
+  "scripts": {
+    "harness:check": "node --check index.js && node --check client.js",
+    "harness:verify": "node verify.mjs"
+  },
+  "dsh": {
+    "id": "dsh-pulse",
+    "name": "缓存命中两位小数",
+    "version": "0.1.0",
+    "repo": "github/qilingzon/dsh-pulse",
+    "permissions": "客户端 slot 注册（只读 useProjection，无宿主侧改动）",
+    "client": {
+      "platform": "web",
+      "immediately": true
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT"
+}

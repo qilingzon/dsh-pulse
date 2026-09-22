@@ -1,0 +1,23 @@
+# Line-ending policy (mirrors po-gen).
+#
+# WHY: the plugin is deployed by PowerShell on Windows but the docs/JSON/JS are also
+# read on Linux hosts; a Windows checkout otherwise dirties README/JSON on every edit
+# and makes `git pull --ff-only` fail. Force LF for text, keep CRLF for Windows launchers.
+# This file itself.
+.gitattributes text eol=lf
+.gitignore     text eol=lf
+LICENSE        text eol=lf
+
+*.md    text eol=lf
+*.json  text eol=lf
+*.js    text eol=lf
+*.mjs   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.txt   text eol=lf
+*.sh    text eol=lf
+
+# Windows-only launchers: cmd.exe / PowerShell 5.1 are happiest with CRLF.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
