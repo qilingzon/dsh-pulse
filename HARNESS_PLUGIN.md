@@ -27,7 +27,7 @@
 | 项 | 值 |
 |---|---|
 | 包名 / `dsh.id` | `dsh-pulse`（**name == 注册 id**，规避 B23） |
-| 版本 | `0.3.0` |
+| 版本 | `0.3.1` |
 | 平台 | `client.platform: web`，`immediately: true` |
 | 依赖 | 仅 `react`（由 `require("react")` 从宿主取） |
 | 注入 | `slots`、`locale` |

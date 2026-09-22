@@ -251,3 +251,50 @@ SMOKE-OK（组件层全部通过）
 - **速度读数在流式段可能滞后一拍**：采样器读的是「最近一次渲染观测到的 `legacy.partial`」。真实运行时每个 `assistant/live-chunk` 都会触发重渲，所以最坏滞后约一个 chunk；若上游改成批量派发 live chunk，滞后会放大到派发间隔。
 - **上游改名即失效**：客户端半部依赖 `window.__ModuleLoader__`、slot 名 `conversation.composer.dock`、投影键 `tokenUsage` / `sessionStats`、store 字段 `legacy.partial`。上游换 kind / 改名会在加载期报 slot 错误（`<home>\logs` 可见），届时改 `client.js` 一行即可；`legacy.partial` 缺失只会让速度读数退回精确线（流式段显示 `—`），不会崩。
 - **未经运行期实测**：本仓库内过了静态自证（`verify.mjs`）与组件层冒烟（`smoke.mjs`），但**没有在真实浏览器里跑过**；实弹要走 lab 的 web 实验窗。
+
+---
+
+## 七、数据真实性分级
+
+本仓库的每个数字都能被归到下面三档之一。**不把第三档说成第一档**是这个项目的底线。
+
+### 第一档 · 源码核对（可复现，证据在 `app.asar`）
+
+| 结论 | 证据 |
+|---|---|
+| `tokenUsage` 投影字段是 `{ uncachedInputTokens, outputTokens, cacheReadTokens, cacheWriteTokens }` | `tokenUsageOf` 的 totals 初始化 + `TokenUsage` 接口声明 |
+| 计费输入口径 = `uncachedInputTokens + cacheReadTokens + cacheWriteTokens` | `function billedInputTokens(usage)` 函数体 |
+| 内置那枚只可能是整数 | `cacheHitPercent` 调 `formatCacheHitPercent(usage.cacheReadTokens, billedInputTokens(usage))`，而该函数签名是 `(…, decimalPlaces = 0)`，且模块私有不导出 |
+| 速度格式 = ≥10 取整 / <10 一位小数 | `function formatTokensPerSecond(tps)` |
+| `sessionStats` 字段 = `{ turns, steps, llmMs, toolMs, ttftMs, ttftSteps, decodeMs, decodeTokens }` | `sessionStatsProjectionDefinition` 的 `wire.view` |
+| **`decodeTokens` 只在步骤结算时前进** | 同定义的 `apply`：仅 `case "assistant/message"` 且 `usageOutputTokens(...)` 非空时 `next.decodeTokens += outputTokens` |
+| `sessionStats` 只在 `assistant/message` / `tool/result` / `step/end` 推送 | 投影推送分支 `if (type === "assistant/message" \|\| …)` |
+| 流式文本走 client-only transient，持久消息在流结束后才 append | `agent-loop.js`：`for await (const chunk of stream) live.push(chunk)`；架构文档「loop 会在 committed end frame 前把完整紧凑 stream 提交为一个 `assistant/message` 或 `assistant/attempt`」 |
+| slot `conversation.composer.dock` = `{ kind: "list", scope: "session" }`，契约 props 含 `useChat` / `useProjection` / `t` | 该 slot 的契约登记项（`slots.ts:170`） |
+| **插件式占用者确实拿到会话工具包** | `todoDockEntry` 用与本插件**完全相同**的注册形状（`ctx.slots.register({ name, id, order }, Comp)`），组件签名 `{ useProjection, t }` |
+| `legacy.partial` = 在飞助手步骤 `{ turn, step, blocks }` | `legacyContribution` 的 `case "assistant-step"` → `data.status === "running"` 分支 |
+| block 形状 `{ kind: "text" \| "reasoning" \| "image" \| "tool-call" \| "other", text? }` | `toAssistantBlock` |
+
+### 第二档 · 本机实测（数字是真的，但测的不是浏览器）
+
+| 数字 | 怎么来的 | 边界 |
+|---|---|---|
+| 每拍 0.21–0.22 µs | `process.hrtime`，20 万次平均，满窗 41 点 | 测的是**纯算术**，**不含** React 渲染成本 |
+| 缓冲恒 41 点 | 20 万拍后复查 `samples.length` | 与平台无关，可靠 |
+| gzip 9.1 KiB | `zlib.gzipSync(level:9)` | 可靠 |
+| 63 + 22 条断言全 PASS | `verify.mjs` / `smoke.mjs` | 断言本身可信；但 smoke 用的是**假 React** |
+| 0.000043% 单核 | 由上两条折算 | **只算采样算术**，不含渲染 |
+
+> 诚实备注：`bench.mjs` 初版把时间步长写成 1 ms/拍，导致环形缓冲不裁剪、测出「95.58 µs / 20001 点」的退化值。修正为真实 500 ms/拍后才是上面的数字。README 里从未出现过那组错值。
+
+### 第三档 · 未验证的推断（必须承认）
+
+| 事项 | 状态 |
+|---|---|
+| **在真实浏览器里跑起来了吗** | **没有**。从未在真实 DSH 中加载过本插件，只过了假 React 冒烟。 |
+| **tok/s 准不准** | **没测过**。精确线用的是产品自己的账，可信；估算线的 `chars/token` 种子 `0.5` 是经验值，README《已知风险》里写的「±50%」同样是估的，**不是实测**。 |
+| 「空闲 0 帧/秒」 | 代码层推论（`displayKey` 闸门 + 单测覆盖），非浏览器实测。 |
+| 「浏览器后台节流约 1 次/分钟」 | 通用行为，未在本机验证具体浏览器版本。 |
+| 首帧延迟、视觉抖动、数字跳动 | 全部未观察过。 |
+
+**要把第三档转成第一/第二档，只需要做一件事**：把插件装进 lab 的 web 实验窗，开一个长回答，录下流式期间的读数与真实 `usage.outputTokens` 对照。本仓库目前没有这个数据，所以不声称有。
