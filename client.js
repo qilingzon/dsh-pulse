@@ -1,5 +1,14 @@
 /* dsh-pulse · client half
- * 在 composer dock 增加一枚「缓存命中 99.87%」两位小数读数（含精确 token 明细 title）。
+ * 在 composer dock 增加两枚只读读数：
+ *   1) 「缓存命中 99.87%」两位小数读数（含精确 token 明细 title）；
+ *   2) 「42.7 tok/s」10 秒滑窗平均输出速度。
+ *
+ * 速度读数的两条数据线（口径写死在 title 里，不混报）：
+ *   精确线 —— sessionStats.decodeTokens 的墙钟斜率。该计数只在 assistant/message 落盘
+ *             （即步骤结算、provider 上报 usage）时前进，所以流式进行中它是平的。
+ *   估算线 —— 流式进行中改读 legacy.partial（客户端独有的 assistant/live-chunk 折叠）
+ *             的实时文本增量，按上一次步骤标定出的 chars/token 折算；带 ~ 前缀。
+ *             步骤一结算，估算线立刻收敛回精确线（同一根累计曲线，不会跳变）。
  *
  * 为什么是「另加一枚」而不是改内置那枚 —— 见 README「能力边界」：
  *   内置百分比在 @deepseek-ai/dsh-client-ui-chat 模块内部就四舍五入完（formatCacheHitPercent
@@ -73,24 +82,197 @@ window.__ModuleLoader__.load({
     }
     // #endregion
 
+    // #region window
+    // 10 秒滑窗速率：纯算术，不碰 React/DOM。verify.mjs 按本区标记抽取做单测 —— 勿改标记。
+
+    var WINDOW_MS = 10000;   // 滑窗长度：用户令「10s 内的平均输出速度」
+    var SAMPLE_MS = 500;     // 采样间隔
+    var MIN_SPAN_MS = 1000;  // 跨度不足 1s 不出数（两点斜率不可信）
+    var RETAIN_MS = WINDOW_MS * 2; // 环形缓冲保留两倍窗长，够取窗沿锚点
+    var RATIO_MIN = 0.05;    // chars/token 标定下界
+    var RATIO_MAX = 8;       // chars/token 标定上界
+    var RATIO_SEED = 0.5;    // 未标定前的兜底：2 chars/token（中英混排经验值）
+
+    function nonNeg(value) {
+      return typeof value === "number" && isFinite(value) && value >= 0 ? value : 0;
+    }
+
+    /** 追加一个采样点并丢掉窗外旧点（原地改数组，返回同一个数组）。 */
+    function pushSample(samples, t, exact, est, retainMs) {
+      samples.push({ t: t, exact: exact, est: est });
+      var floor = t - retainMs;
+      var drop = 0;
+      while (drop < samples.length - 2 && samples[drop + 1].t <= floor) drop += 1;
+      if (drop > 0) samples.splice(0, drop);
+      return samples;
+    }
+
+    /** 取窗内最老的点作为锚（保留紧邻窗外那点，让跨度尽量贴近窗长）。 */
+    function windowAnchor(samples, now, windowMs) {
+      var edge = now - windowMs;
+      var i = 0;
+      while (i < samples.length - 2 && samples[i + 1].t <= edge) i += 1;
+      return samples[i];
+    }
+
+    /** 窗内某计数器的墙钟斜率。样本不足 / 计数器回退 → null（不猜）。 */
+    function windowSlope(samples, now, field, windowMs, minSpanMs) {
+      if (!samples || samples.length < 2) return null;
+      var anchor = windowAnchor(samples, now, windowMs);
+      var last = samples[samples.length - 1];
+      var spanMs = last.t - anchor.t;
+      if (!(spanMs >= minSpanMs)) return null;
+      var delta = last[field] - anchor[field];
+      if (!isFinite(delta) || delta < 0) return null;
+      return { rate: delta / (spanMs / 1000), tokens: delta, spanMs: spanMs, points: samples.length };
+    }
+
+    /** 与产品 formatTokensPerSecond 同款：≥10 取整，<10 保留一位小数。 */
+    function formatRate(rate) {
+      if (typeof rate !== "number" || !isFinite(rate) || rate < 0) return null;
+      return rate >= 10 ? String(Math.round(rate)) : String(Math.round(rate * 10) / 10);
+    }
+
+    /** 标定 chars/token：步骤结算后用「本步精确 tokens ÷ 本步字符数」重算，越界则保持旧值。 */
+    function calibrateRatio(chars, tokens, previous) {
+      if (!(chars > 0) || !(tokens > 0)) return previous;
+      var ratio = tokens / chars;
+      if (!isFinite(ratio) || ratio <= 0) return previous;
+      if (ratio < RATIO_MIN) return RATIO_MIN;
+      if (ratio > RATIO_MAX) return RATIO_MAX;
+      return ratio;
+    }
+
+    /** 估算累计输出 tokens = 本步起点精确值 + 本步实时字符数 × 标定比。 */
+    function estimateTokens(stepStartTokens, chars, ratio) {
+      return nonNeg(stepStartTokens) + nonNeg(chars) * (ratio > 0 ? ratio : RATIO_SEED);
+    }
+
+    /** 从 legacy.partial 的 blocks 里数正文字符（text + reasoning），不数工具调用参数。 */
+    function liveChars(partial) {
+      if (partial === null || typeof partial !== "object") return 0;
+      var blocks = partial.blocks;
+      if (!blocks || typeof blocks.length !== "number") return 0;
+      var total = 0;
+      for (var i = 0; i < blocks.length; i += 1) {
+        var block = blocks[i];
+        if (block === null || typeof block !== "object") continue;
+        if (block.kind !== "text" && block.kind !== "reasoning") continue;
+        if (typeof block.text === "string") total += block.text.length;
+      }
+      return total;
+    }
+
+    /** 精确累计输出 tokens：sessionStats.decodeTokens 优先，tokenUsage.outputTokens 兜底。 */
+    function exactOutputTokens(sessionStats, usage) {
+      if (sessionStats !== null && typeof sessionStats === "object" && typeof sessionStats.decodeTokens === "number") {
+        return nonNeg(sessionStats.decodeTokens);
+      }
+      if (usage !== null && typeof usage === "object" && typeof usage.outputTokens === "number") {
+        return nonNeg(usage.outputTokens);
+      }
+      return null;
+    }
+
+    /** 采样器的全部状态。挂载期存活于 ref，不参与 React 状态树。 */
+    function createMeterState() {
+      return {
+        samples: [],
+        ratio: RATIO_SEED,
+        running: false,
+        stepStartTokens: 0,
+        stepPeakChars: 0,
+        estTokens: 0,
+        lastNow: 0,
+        sessionStats: undefined,
+        usage: undefined,
+        partial: null
+      };
+    }
+
+    /**
+     * 推进一个采样点：维护步骤沿、标定比与估算累计值。
+     * 步骤开始 → 记下起点精确 tokens；步骤进行中 → 估算值随字符数增长；
+     * 步骤结算 → 用「本步精确 tokens ÷ 本步字符数」重标 ratio，估算值收敛回精确值。
+     * @param state - createMeterState() 的对象（原地改，返回同一对象）。
+     * @param now - 墙钟毫秒。
+     * @param exact - 精确累计输出 tokens；null 表示两个投影都不可用。
+     * @param chars - 当前在飞步骤的实时正文字符数。
+     * @param running - 是否处于流式进行中。
+     */
+    function stepMeter(state, now, exact, chars, running) {
+      if (running && !state.running) {
+        state.running = true;
+        state.stepPeakChars = 0;
+        state.stepStartTokens = exact === null ? 0 : exact;
+      }
+      if (running) {
+        if (chars > state.stepPeakChars) state.stepPeakChars = chars;
+        state.estTokens = estimateTokens(state.stepStartTokens, chars, state.ratio);
+      } else {
+        if (state.running) {
+          state.running = false;
+          var settled = exact === null ? 0 : exact;
+          state.ratio = calibrateRatio(state.stepPeakChars, settled - state.stepStartTokens, state.ratio);
+          state.stepPeakChars = 0;
+        }
+        state.estTokens = exact === null ? 0 : exact;
+      }
+      if (exact !== null) pushSample(state.samples, now, exact, state.estTokens, RETAIN_MS);
+      state.lastNow = now;
+      return state;
+    }
+    // #endregion
+
     var ZH = {
       "cachehit.pill": "缓存命中 {percent}%",
-      "cachehit.title": "会话累计缓存命中 {percent}% ｜ 缓存读取 {read} tok ｜ 未缓存输入 {uncached} tok ｜ 缓存写入 {write} tok ｜ 计费输入 {denominator} tok"
+      "cachehit.title": "会话累计缓存命中 {percent}% ｜ 缓存读取 {read} tok ｜ 未缓存输入 {uncached} tok ｜ 缓存写入 {write} tok ｜ 计费输入 {denominator} tok",
+      "tps.pill": "{tps} tok/s",
+      "tps.pillEst": "~{tps} tok/s",
+      "tps.idle": "— tok/s",
+      "tps.title": "近 {window} 秒平均输出速度 {tps} tok/s ｜ 窗口内输出 {tokens} tok ｜ 实测跨度 {span}s ｜ 采样 {points} 点 ｜ 口径：精确（sessionStats.decodeTokens 的墙钟斜率）",
+      "tps.titleEst": "近 {window} 秒平均输出速度约 {tps} tok/s（流式进行中，宿主尚未上报 usage）｜ 窗口内估算输出 {tokens} tok ｜ 实测跨度 {span}s ｜ 采样 {points} 点 ｜ 折算比 {ratio} chars/token，由上一次步骤结算时标定",
+      "tps.titleIdle": "近 {window} 秒无输出（会话空闲，或刚进入流式还没采到两点）"
     };
     var EN = {
       "cachehit.pill": "Cache hit {percent}%",
-      "cachehit.title": "Session cache hit {percent}% | cached input {read} tok | uncached input {uncached} tok | cache write {write} tok | billed input {denominator} tok"
+      "cachehit.title": "Session cache hit {percent}% | cached input {read} tok | uncached input {uncached} tok | cache write {write} tok | billed input {denominator} tok",
+      "tps.pill": "{tps} tok/s",
+      "tps.pillEst": "~{tps} tok/s",
+      "tps.idle": "— tok/s",
+      "tps.title": "Output speed over the last {window}s: {tps} tok/s | {tokens} tok in window | measured span {span}s | {points} samples | exact (wall-clock slope of sessionStats.decodeTokens)",
+      "tps.titleEst": "Output speed over the last {window}s: about {tps} tok/s (streaming; usage not reported yet) | ~{tokens} tok in window | measured span {span}s | {points} samples | {ratio} chars/token, calibrated at the previous step settle",
+      "tps.titleIdle": "No output in the last {window}s (idle, or fewer than two samples since streaming began)"
     };
 
     var ANCHOR_STYLE = {
       display: "inline-flex",
-      alignItems: "center"
+      alignItems: "center",
+      gap: "6px"
     };
     var PILL_STYLE = {
       display: "inline-flex",
       alignItems: "center",
       gap: "4px",
       padding: "2px 8px",
+      borderRadius: "999px",
+      border: "1px solid rgba(128, 128, 128, 0.35)",
+      color: "inherit",
+      fontSize: "11px",
+      lineHeight: "16px",
+      fontFamily: "inherit",
+      fontVariantNumeric: "tabular-nums",
+      whiteSpace: "nowrap",
+      userSelect: "none"
+    };
+    // 速度读数用同一枚 pill 的外观，另加固定最小宽度 —— 数字跳动时整条 dock 不抖。
+    var TPS_STYLE = {
+      display: "inline-flex",
+      alignItems: "center",
+      justifyContent: "flex-end",
+      gap: "4px",
+      padding: "2px 8px",
+      minWidth: "58px",
       borderRadius: "999px",
       border: "1px solid rgba(128, 128, 128, 0.35)",
       color: "inherit",
@@ -108,6 +290,23 @@ window.__ModuleLoader__.load({
         return typeof useProjection === "function" ? useProjection(key) : undefined;
       } catch (e) {
         return undefined;
+      }
+    }
+
+    /**
+     * 读取「在飞的助手步骤」：legacy.partial = { turn, step, blocks }。
+     * 它由客户端独有的 assistant/live-chunk 折叠而来 —— 流式进行中宿主还没有 usage，
+     * 只有这份实时文本可用。字段缺失 / 未桥接 → null，绝不让 dock 崩。
+     */
+    function readLivePartial(useChat) {
+      try {
+        if (typeof useChat !== "function") return null;
+        var partial = useChat(function (s) {
+          return s && s.legacy ? s.legacy.partial : null;
+        });
+        return partial === undefined ? null : partial;
+      } catch (e) {
+        return null;
       }
     }
 
@@ -158,35 +357,125 @@ window.__ModuleLoader__.load({
       return String(value).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
     }
 
+    /** 把采样状态折算成这一帧要显示的速率文案与 tooltip。 */
+    function readRate(state, now, running, seat) {
+      var windowSec = String(WINDOW_MS / 1000);
+      var slope = windowSlope(state.samples, now, running ? "est" : "exact", WINDOW_MS, MIN_SPAN_MS);
+      if (slope !== null && slope.rate > 0) {
+        var rate = formatRate(slope.rate);
+        if (rate !== null) {
+          var params = {
+            window: windowSec,
+            tps: rate,
+            tokens: group(Math.round(slope.tokens)),
+            span: (slope.spanMs / 1000).toFixed(1),
+            points: String(slope.points),
+            ratio: String(Math.round(state.ratio * 1000) / 1000)
+          };
+          return {
+            key: rate,
+            text: tr(seat, running ? "tps.pillEst" : "tps.pill", params, running ? "~{tps} tok/s" : "{tps} tok/s"),
+            // fallback 与 ZH 字典逐字同源：i18n 未命中时 tooltip 也必须写清口径来源。
+            title: tr(
+              seat,
+              running ? "tps.titleEst" : "tps.title",
+              params,
+              running
+                ? "近 {window} 秒平均输出速度约 {tps} tok/s（流式进行中，宿主尚未上报 usage）｜ 窗口内估算输出 {tokens} tok ｜ 实测跨度 {span}s ｜ 采样 {points} 点 ｜ 折算比 {ratio} chars/token，由上一次步骤结算时标定"
+                : "近 {window} 秒平均输出速度 {tps} tok/s ｜ 窗口内输出 {tokens} tok ｜ 实测跨度 {span}s ｜ 采样 {points} 点 ｜ 口径：精确（sessionStats.decodeTokens 的墙钟斜率）"
+            )
+          };
+        }
+      }
+      return {
+        key: "idle",
+        text: tr(seat, "tps.idle", {}, "— tok/s"),
+        title: tr(seat, "tps.titleIdle", { window: windowSec }, "近 {window} 秒无输出（会话空闲，或刚进入流式还没采到两点）")
+      };
+    }
+
     function PulseDock(props) {
       var seat = props.t;
       var usage = readProjection(props.useProjection, "tokenUsage");
+      var sessionStats = readProjection(props.useProjection, "sessionStats");
+      var partial = readLivePartial(props.useChat);
       var view = computeView(usage);
-      if (view === null) return null;
 
-      var params = {
-        percent: view.percent,
-        read: group(view.read),
-        uncached: group(view.uncached),
-        write: group(view.write),
-        denominator: group(view.denominator)
-      };
-      var text = tr(seat, "cachehit.pill", params, "缓存命中 {percent}%");
-      var title = tr(seat, "cachehit.title", params, "会话累计缓存命中 {percent}% ｜ 缓存读取 {read} tok ｜ 未缓存输入 {uncached} tok ｜ 缓存写入 {write} tok ｜ 计费输入 {denominator} tok");
+      var tick = react.useState(0);
+      var setTick = tick[1];
+      var meterRef = react.useRef(null);
+      if (meterRef.current === null) meterRef.current = createMeterState();
 
-      return react.createElement(
-        "span",
-        { style: ANCHOR_STYLE, "data-pulse": view.percent },
+      // 渲染期只做观测赋值：投影 / 实时态一变就会重渲，ref 因此总是最新。
+      var meter = meterRef.current;
+      meter.sessionStats = sessionStats;
+      meter.usage = usage;
+      meter.partial = partial;
+
+      react.useEffect(function () {
+        var id = setInterval(function () {
+          var state = meterRef.current;
+          var exact = exactOutputTokens(state.sessionStats, state.usage);
+          var streaming = state.partial !== null && state.partial !== undefined;
+          stepMeter(state, Date.now(), exact, liveChars(state.partial), streaming);
+          setTick(function (n) { return n + 1; });
+        }, SAMPLE_MS);
+        return function () {
+          clearInterval(id);
+        };
+      }, []);
+
+      var streamingNow = partial !== null && partial !== undefined;
+      var rate = readRate(meter, Date.now(), streamingNow, seat);
+      if (view === null && rate.key === "idle") return null;
+
+      var children = [];
+      if (view !== null) {
+        var params = {
+          percent: view.percent,
+          read: group(view.read),
+          uncached: group(view.uncached),
+          write: group(view.write),
+          denominator: group(view.denominator)
+        };
+        var hitText = tr(seat, "cachehit.pill", params, "缓存命中 {percent}%");
+        var hitTitle = tr(seat, "cachehit.title", params, "会话累计缓存命中 {percent}% ｜ 缓存读取 {read} tok ｜ 未缓存输入 {uncached} tok ｜ 缓存写入 {write} tok ｜ 计费输入 {denominator} tok");
+        children.push(
+          react.createElement(
+            "span",
+            {
+              key: "cachehit",
+              style: PILL_STYLE,
+              title: hitTitle,
+              "aria-label": hitTitle,
+              role: "status"
+            },
+            hitText
+          )
+        );
+      }
+      children.push(
         react.createElement(
           "span",
           {
-            style: PILL_STYLE,
-            title: title,
-            "aria-label": title,
+            key: "tps",
+            style: TPS_STYLE,
+            title: rate.title,
+            "aria-label": rate.title,
             role: "status"
           },
-          text
+          rate.text
         )
+      );
+
+      return react.createElement(
+        "span",
+        {
+          style: ANCHOR_STYLE,
+          "data-pulse": view === null ? "na" : view.percent,
+          "data-pulse-tps": rate.key
+        },
+        children
       );
     }
 
@@ -211,7 +500,20 @@ window.__ModuleLoader__.load({
     exports.name = "dsh-pulse";
     exports.inject = inject;
     exports.apply = apply;
-    exports.__test = { formatCacheHitPercent: formatCacheHitPercent, computeView: computeView };
+    exports.__test = {
+      formatCacheHitPercent: formatCacheHitPercent,
+      computeView: computeView,
+      createMeterState: createMeterState,
+      stepMeter: stepMeter,
+      windowSlope: windowSlope,
+      formatRate: formatRate,
+      calibrateRatio: calibrateRatio,
+      estimateTokens: estimateTokens,
+      liveChars: liveChars,
+      exactOutputTokens: exactOutputTokens,
+      readRate: readRate,
+      PulseDock: PulseDock
+    };
     return module.exports;
   }
 });

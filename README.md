@@ -1,8 +1,8 @@
-# dsh-pulse · 缓存命中两位小数（插件版）
+# dsh-pulse · 缓存命中两位小数 + 10 秒输出速度
 
-> DeepSeek Harness 客户端插件：把「缓存命中」的百分比从整数读数升级为**两位小数**读数 —— 不改产品二进制、可版本化、可卸载。
+> DeepSeek Harness 客户端插件：在 composer dock 增加两枚只读读数 —— **缓存命中两位小数** 与 **10 秒滑窗平均输出速度（tok/s）**。不改产品二进制、可版本化、可卸载。
 >
-> 仓库：<https://github.com/qilingzon/dsh-pulse> ｜ 许可：MIT ｜ 版本：0.1.0
+> 仓库：<https://github.com/qilingzon/dsh-pulse> ｜ 许可：MIT ｜ 版本：0.2.0
 >
 > 前身是本地实验件 `dsh-cachehit-2dp`（A27），本仓库是它的正式发布形态。当时并行的另一条路线是 asar 最小增量补丁（未随仓库发布，仅存于本机实验目录）。两条路线的能力不同，见下面《能力边界》——**先看那张表再选**。
 
@@ -10,16 +10,37 @@
 
 ## 一、它做什么
 
-在 `conversation.composer.dock` 注册一枚**只读** pill：
+在 `conversation.composer.dock` 注册两枚**只读** pill：
 
 ```
-缓存命中 99.87%
+缓存命中 99.87%   42.7 tok/s
 ```
+
+### 1. 缓存命中（两位小数）
 
 - 数据来自 `useProjection("tokenUsage")` —— 与内置那枚**同一个投影**，不是估算、不是另算一份账。
 - 口径与内置完全一致：`缓存读取 ÷ (未缓存输入 + 缓存读取 + 缓存写入)`；「部分命中绝不显示 100%」的诚实分支逐字同源。
 - `title` / `aria-label` 给出精确明细：`会话累计缓存命中 99.87% ｜ 缓存读取 1,234,567 tok ｜ 未缓存输入 16,234 tok ｜ 缓存写入 0 tok ｜ 计费输入 1,250,801 tok`。
 - 不写宿主、不碰 DOM、不引用产品 CSS 类名、不走 RPC、不注册服务。
+
+### 2. 10 秒滑窗平均输出速度（tok/s）
+
+- **窗口**：10000 ms 墙钟，采样间隔 500 ms，环形缓冲保留两倍窗长（取窗沿锚点，跨度尽量贴满 10s）。
+- **格式**：与产品 `formatTokensPerSecond` 同款 —— `≥10` 取整（`43 tok/s`），`<10` 保留一位小数（`9.9 tok/s`）。
+- **空闲**：窗内没有新增输出 → 显示 `— tok/s`，不显示假的 `0.0`。
+- **跨度不足 1s** 或**计数器回退** → 不出数（`—`），不拿两点算斜率、不报负数。
+- `title` / `aria-label` 写清本帧的口径来源、窗口内 tokens、实测跨度、采样点数。
+
+**两条数据线（这是本读数的关键设计）：**
+
+| | 来源 | 何时前进 | 显示 |
+|---|---|---|---|
+| **精确线** | `useProjection("sessionStats").decodeTokens` 的墙钟斜率 | 只在 `assistant/message` 落盘（步骤结算、provider 上报 usage）时 | `43 tok/s` |
+| **估算线** | `useChat(s => s.legacy.partial)` 的实时正文字符数增量 × 标定比 | 每个 `assistant/live-chunk`（流式进行中） | `~43 tok/s` |
+
+估算线**自标定**：每次步骤结算时，用「本步精确 tokens ÷ 本步字符数」重算 `chars/token`（夹紧在 `[0.05, 8]`），下一步的实时折算就用这个实测比。步骤一结算，估算值立刻收敛回精确值 —— 两条线是同一根累计曲线，不会跳变。
+
+> **为什么必须有估算线**：宿主在流式进行中**根本不知道 token 数**。`sessionStats.decodeTokens` 只在 `assistant/message` 事件落盘时 +usage（见 `sessionStatsProjectionDefinition.apply` 的 `case "assistant/message"`）；流式阶段走的是客户端独有的 transient `assistant/live-chunk`，**只带文本块和时间戳，不带 usage**。所以「流式进行中显示一个精确 tok/s」在这个宿主上不可能 —— 唯一可用的活信号就是文本增长速度。本插件把它标成 `~` 而不是假装精确。
 
 ---
 
@@ -94,10 +115,12 @@ powershell -ExecutionPolicy Bypass -File uninstall.ps1 -DshHome "C:\Users\you\.d
 ## 四、自证
 
 ```powershell
-node verify.mjs
+node verify.mjs   # 纯函数断言：语法 + 两位小数 formatter + 10 秒滑窗算术 + 注册面
+node smoke.mjs    # 组件层冒烟：真装载 client.js，假 React 下渲染 PulseDock
+npm run harness:test   # 两个都跑
 ```
 
-输出（实测，EXIT=0）：
+### `verify.mjs`（实测，EXIT=0，51 条断言全 PASS）
 
 ```
 === 1. 语法检查 ===
@@ -116,17 +139,56 @@ node verify.mjs
   PASS  无计费输入 → null          f(1, 0, 2) = null
   PASS  部分命中不伪装 100：f(99999, 100000, 2) = "99.999"
   PASS  部分命中不伪装 100：f(999996, 1000000, 2) = "99.9996"
-=== 3. 注册面静态核对 ===
+=== 3. 10 秒滑窗速率（抽取 window 区做行为断言） ===
+  PASS  liveChars 只数 text+reasoning（5+2=7），不数 tool-call 参数
+  PASS  exactOutputTokens 优先 sessionStats = 120
+  PASS  exactOutputTokens 回退 tokenUsage = 9
+  PASS  两个投影都缺 → null（不出数，不猜）
+  PASS  formatRate(42.7) = "43"（≥10 取整，同产品 formatTokensPerSecond）
+  PASS  formatRate(9.87) = "9.9"（<10 保留一位小数）
+  PASS  calibrateRatio 越界夹紧（下界 0.05 / 上界 8）
+  PASS  pushSample 裁掉窗外旧点：剩 6 点、最老 t=5000
+  PASS  满窗斜率：100 tok / 10s = 10 tok/s
+  PASS  窗沿锚点取到 t=2000：80 tok / 8s = 10 tok/s
+  PASS  跨度不足 1s → null（两点斜率不可信）
+  PASS  计数器回退 → null（不报负数）
+  PASS  步骤结算 → 标定比 = 600 tokens / 500 字符 = 1.2
+  PASS  结算后估算收敛回精确值 600（不跳变）
+  PASS  第二步用新比：600 + 100 × 1.2 = 720
+  PASS  估算窗斜率 = 720 tok / 4s = 180 tok/s
+  PASS  精确窗斜率 = 600 tok / 4s = 150 tok/s（流式段仍是平线，故低于估算）
+=== 4. 注册面静态核对 ===
   PASS  注册目标 = conversation.composer.dock
   PASS  entry id = "pulse"（不与内置 "stats" 撞 id）
   PASS  order = 1（紧随内置 order 0）
-  PASS  声明 locale 席位 → 组件拿到 t
+  PASS  滑窗 = 10000ms（用户令「10s 内」）
+  PASS  读 sessionStats 投影（精确输出 tokens 的唯一权威来源）
+  PASS  读 legacy.partial（流式进行中宿主没有 usage，只有这份实时文本）
+  PASS  采样循环随卸载清理（不泄漏定时器）
+  PASS  速度读数带 data-pulse-tps 探针
   PASS  ModuleLoader id = dsh-pulse
-  PASS  require("react")
-  PASS  导出 inject / apply
   PASS  不碰 DOM / 不引用产品选择器
   PASS  不走宿主 RPC（纯读投影）
 VERIFY-OK（全部断言通过）
+```
+
+### `smoke.mjs`（实测，EXIT=0，22 条断言全 PASS）
+
+真装载 `client.js`（走 `window.__ModuleLoader__.load`），用假 React 渲染 `PulseDock`：
+
+```
+  PASS  ModuleLoader id = dsh-pulse
+  PASS  根 span 下有两枚 pill（缓存命中 + 速度）
+  PASS  缓存命中 pill = "缓存命中 87.43%"
+  PASS  无采样时速度 pill = "— tok/s"
+  PASS  两个数据源都缺 → 返回 null（不占位）
+  PASS  流式估算文案 = "~180 tok/s"
+  PASS  估算态 title 明示「流式进行中」／带标定比
+  PASS  结算后精确文案 = "150 tok/s"（不带 ~）／title 写明口径来源
+  PASS  挂载后启动了采样定时器；卸载时 clearInterval 被调用（不泄漏）
+  PASS  两拍（0s/2s，100→500 字符）→ 200 估算 tok / 2s = 100 tok/s
+  PASS  流式 pill 带 ~ 前缀："~100 tok/s"
+SMOKE-OK（组件层全部通过）
 ```
 
 ---
@@ -135,5 +197,7 @@ VERIFY-OK（全部断言通过）
 
 - **两枚读数**：与内置 pill 并存时，一枚 `99%`、一枚 `99.87%`。这是 slot 模型的硬约束，不是 bug（见《能力边界》）。
 - **投影未桥接不渲染**：`tokenUsage` 缺失或 `cacheReadTokens` 非数字时返回 `null`，不崩、不占位。
-- **上游改名即失效**：客户端半部依赖 `window.__ModuleLoader__`、slot 名 `conversation.composer.dock`、投影键 `tokenUsage`。上游换 kind / 改名会在加载期报 slot 错误（`<home>\logs` 可见），届时改 `client.js` 一行即可。
-- **未经运行期实测**：本仓库内只过了静态自证（`verify.mjs`）；浏览器实弹要走 lab 的 web 实验窗。
+- **速度读数在流式段是估算**：`~` 前缀即声明这一点。首步未标定前用种子比 `0.5 chars/token`（中英混排经验值），误差可能到 ±50%；一个步骤结算后即换成本会话实测比，误差随之收敛。
+- **速度读数在流式段可能滞后一拍**：采样器读的是「最近一次渲染观测到的 `legacy.partial`」。真实运行时每个 `assistant/live-chunk` 都会触发重渲，所以最坏滞后约一个 chunk；若上游改成批量派发 live chunk，滞后会放大到派发间隔。
+- **上游改名即失效**：客户端半部依赖 `window.__ModuleLoader__`、slot 名 `conversation.composer.dock`、投影键 `tokenUsage` / `sessionStats`、store 字段 `legacy.partial`。上游换 kind / 改名会在加载期报 slot 错误（`<home>\logs` 可见），届时改 `client.js` 一行即可；`legacy.partial` 缺失只会让速度读数退回精确线（流式段显示 `—`），不会崩。
+- **未经运行期实测**：本仓库内过了静态自证（`verify.mjs`）与组件层冒烟（`smoke.mjs`），但**没有在真实浏览器里跑过**；实弹要走 lab 的 web 实验窗。

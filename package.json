@@ -1,6 +1,6 @@
 {
   "name": "dsh-pulse",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "客户端插件：在 composer dock 增加一枚「缓存命中 99.87%」两位小数读数（含精确 token 明细）。只读投影，不改宿主。",
   "type": "module",
   "main": "index.js",
@@ -16,6 +16,7 @@
     "install.ps1",
     "uninstall.ps1",
     "verify.mjs",
+    "smoke.mjs",
     "HARNESS_PLUGIN.md",
     "README.md",
     "LICENSE"
@@ -38,12 +39,14 @@
   },
   "scripts": {
     "harness:check": "node --check index.js && node --check client.js",
-    "harness:verify": "node verify.mjs"
+    "harness:verify": "node verify.mjs",
+    "harness:smoke": "node smoke.mjs",
+    "harness:test": "node verify.mjs && node smoke.mjs"
   },
   "dsh": {
     "id": "dsh-pulse",
     "name": "缓存命中两位小数",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "repo": "github/qilingzon/dsh-pulse",
     "permissions": "客户端 slot 注册（只读 useProjection，无宿主侧改动）",
     "client": {
