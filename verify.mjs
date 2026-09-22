@@ -67,9 +67,9 @@ console.log("=== 3. 10 秒滑窗速率（抽取 window 区做行为断言） ===
     const region = src.slice(ws, we);
     const w = new Function(
       region +
-        "\nreturn { createMeterState, stepMeter, pushSample, windowSlope, formatRate, calibrateRatio, estimateTokens, liveChars, exactOutputTokens };"
+        "\nreturn { createMeterState, stepMeter, pushSample, windowSlope, formatRate, displayKey, calibrateRatio, estimateTokens, liveChars, exactOutputTokens };"
     )();
-    const { createMeterState, stepMeter, pushSample, windowSlope, formatRate, calibrateRatio, estimateTokens, liveChars, exactOutputTokens } = w;
+    const { createMeterState, stepMeter, pushSample, windowSlope, formatRate, displayKey, calibrateRatio, estimateTokens, liveChars, exactOutputTokens } = w;
 
     ok(liveChars(null) === 0, "liveChars(null) = 0（不崩）");
     ok(liveChars({ blocks: [] }) === 0, "liveChars(空 blocks) = 0");
@@ -129,6 +129,14 @@ console.log("=== 3. 10 秒滑窗速率（抽取 window 区做行为断言） ===
     const exactSlope = windowSlope(m.samples, 5000, "exact", 10000, 1000);
     ok(estSlope !== null && estSlope.rate === 180, "估算窗斜率 = 720 tok / 4s = 180 tok/s");
     ok(exactSlope !== null && exactSlope.rate === 150, "精确窗斜率 = 600 tok / 4s = 150 tok/s（流式段仍是平线，故低于估算）");
+
+    // displayKey：重渲闸门的指纹。值没变必须同串，态变了必须异串。
+    const fresh = createMeterState();
+    ok(displayKey(fresh, 1000, false) === "idle", "空采样 → displayKey = idle（挂载后第一帧不重渲）");
+    ok(displayKey(m, 5000, false) === "150", "结算态 displayKey = 150（不带 ~）");
+    ok(displayKey(m, 5000, true) === "~180", "流式态 displayKey = ~180（带 ~）");
+    ok(displayKey(m, 5000, false) === displayKey(m, 5000, false), "同一状态两次求指纹相同 → 不会重复重渲");
+    ok(displayKey(m, 5000, true) !== displayKey(m, 5000, false), "流式↔结算切换必须换指纹 → 不会漏掉 ~ 的消失");
   }
 }
 

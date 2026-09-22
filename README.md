@@ -2,7 +2,7 @@
 
 > DeepSeek Harness 客户端插件：在 composer dock 增加两枚只读读数 —— **缓存命中两位小数** 与 **10 秒滑窗平均输出速度（tok/s）**。不改产品二进制、可版本化、可卸载。
 >
-> 仓库：<https://github.com/qilingzon/dsh-pulse> ｜ 许可：MIT ｜ 版本：0.2.0
+> 仓库：<https://github.com/qilingzon/dsh-pulse> ｜ 许可：MIT ｜ 版本：0.3.0
 >
 > 前身是本地实验件 `dsh-cachehit-2dp`（A27），本仓库是它的正式发布形态。当时并行的另一条路线是 asar 最小增量补丁（未随仓库发布，仅存于本机实验目录）。两条路线的能力不同，见下面《能力边界》——**先看那张表再选**。
 
@@ -80,18 +80,26 @@ node verify.mjs            # 先自证：期望 VERIFY-OK / EXIT=0
 
 ### 装到某个 DSH home
 
-只动你指定的 `<DshHome>`，**默认不碰生产 `C:\Users\you\.dsh`**。
+只动你指定的 `<DshHome>`，**默认不碰生产 `~/.dsh`**。
+
+**Linux / macOS / VPS：**
+
+```bash
+./install.sh --plan                                   # 先看计划（不动盘）
+./install.sh                                          # 用 $DSH_HOME（未设则 ~/.dsh），profile = web
+./install.sh --dsh-home /opt/dsh --profiles web,gen4-lab
+./install.sh --dsh-home /opt/dsh --profiles web --remove
+```
+
+**Windows：**
 
 ```powershell
-# 先看计划（不动盘）
 powershell -ExecutionPolicy Bypass -File install.ps1 -DshHome "C:\Users\you\.dsh" -Profiles web -Plan
-
-# 安装（三处解析位 + profile 注册；自动备份；逐字节回读；JSON 非法自动回滚）
 powershell -ExecutionPolicy Bypass -File install.ps1 -DshHome "C:\Users\you\.dsh" -Profiles web
-
-# 卸载
 powershell -ExecutionPolicy Bypass -File uninstall.ps1 -DshHome "C:\Users\you\.dsh" -Profiles web
 ```
+
+两个脚本行为等价：三处解析位 + profile 注册；**先备份再覆盖**；**逐字节 sha256 回读**；`package.json` 补丁后过 JSON 合法性闸门，**不合法立即回滚**；重复执行幂等。JSON 闸门优先用 `node`，退到 `python3`，都没有才做括号配对粗检（会打印提示）。
 
 也可以不用脚本，直接把本目录当本地包挂进 profile：
 
@@ -100,14 +108,14 @@ powershell -ExecutionPolicy Bypass -File uninstall.ps1 -DshHome "C:\Users\you\.d
 "dsh": { "profile": { "bundles": [ "...", "dsh-pulse" ] } }
 ```
 
-装完按 B18/B20 的接棒四步收口：`cd <home>\profiles\<profile>` → `pnpm install` → 重启该 profile → **新开对话**（不是刷新旧会话）才见生效。
+装完按 B18/B20 的接棒四步收口：`cd <home>/profiles/<profile>` → `pnpm install` → 重启该 profile → **新开对话**（不是刷新旧会话）才见生效。
 
 三处解析位（一个都不能少，B18/B23 的教训）：
 
 ```
-<home>\node_modules\dsh-pulse
-<home>\plugins\dsh-pulse
-<home>\profiles\<profile>\node_modules\dsh-pulse
+<home>/node_modules/dsh-pulse
+<home>/plugins/dsh-pulse
+<home>/profiles/<profile>/node_modules/dsh-pulse
 ```
 
 ---
@@ -117,10 +125,11 @@ powershell -ExecutionPolicy Bypass -File uninstall.ps1 -DshHome "C:\Users\you\.d
 ```powershell
 node verify.mjs   # 纯函数断言：语法 + 两位小数 formatter + 10 秒滑窗算术 + 注册面
 node smoke.mjs    # 组件层冒烟：真装载 client.js，假 React 下渲染 PulseDock
-npm run harness:test   # 两个都跑
+node bench.mjs    # 性能实测：每拍开销 / 常驻内存 / 发布体积
+npm run harness:test   # verify + smoke 都跑
 ```
 
-### `verify.mjs`（实测，EXIT=0，51 条断言全 PASS）
+### `verify.mjs`（实测，EXIT=0，63 条断言全 PASS）
 
 ```
 === 1. 语法检查 ===
@@ -193,7 +202,48 @@ SMOKE-OK（组件层全部通过）
 
 ---
 
-## 五、已知风险
+## 五、性能负担（实测，不是估算）
+
+`npm run harness:bench` 可复算。测法：把窗口塞满 41 个采样点、处于流式态，循环 20 万次 `stepMeter + displayKey`（即 interval 回调做的全部事），取平均。
+
+```
+=== 1. 采样一拍的开销（含满窗 41 点的算术） ===
+  满窗采样点数 = 41（RETAIN_MS / SAMPLE_MS + 1）
+  每拍 = 0.22 µs  （stepMeter + displayKey，200000 次平均）
+  20 万拍后缓冲仍为 41 点 → 环形裁剪生效，不随时间增长
+
+=== 2. 折算到真实运行 ===
+  采样频率 = 2 次/秒（SAMPLE_MS = 500）
+  持续 CPU = 0.43 µs/秒 = 0.000043% 单核
+  跑满 1 小时 = 0.002 ms CPU
+
+=== 3. 常驻内存 ===
+  环形缓冲 = 41 个采样点 × 3 个 number = 123 个数值
+  粗估堆占用 ≈ 0.96 KiB
+  其余状态：ratio / running / stepStartTokens / stepPeakChars / estTokens / renderedKey —— 6 个标量
+
+=== 4. 发布体积 ===
+  client.js  23011 B → gzip 7849 B
+  index.js     769 B → gzip  616 B
+  cordis.patch.yml 48 B → gzip 60 B
+  package.json 1569 B → gzip 766 B
+  合计       25397 B → gzip 9291 B (9.1 KiB)
+```
+
+**四条让它轻的硬约束：**
+
+1. **渲染闸门**：采样循环每拍算一个 `displayKey` 指纹，**和上一帧一样就不 `setState`**。空闲时渲染 **0 帧/秒**；流式时最多 2 帧/秒（且数字没变就不渲）。挂载期间不会出现「为了刷新一个不变的数字而每 500ms 重渲」。
+2. **环形缓冲有界**：`RETAIN_MS = 20000`，缓冲恒为 41 点，**不随时间增长**（20 万拍后仍是 41）。
+3. **宿主侧零增量**：`index.js` 是空实现 —— 不注入提示词、不注册服务、不落盘、不开线程。**VPS 上的 DSH 进程不因本插件多花一个指令。**
+4. **浏览器自带节流**：标签页切到后台时，浏览器会把 `setInterval` 节流到约 1 次/分钟 —— 后台挂着更省。
+
+> **对 VPS 部署的含义**：本插件是**客户端（`client.platform: web`）**插件，采样循环跑在**访问者的浏览器**里，不跑在服务器上。VPS 只多传一次 9.1 KiB 的 gzip 静态资源（且随客户端 bundle 缓存），之后 CPU / 内存 / IO 增量都是 0。上面那 0.000043% 单核是**浏览器**的账，不是 VPS 的账。
+
+> 数字取自本机 Node 20 的 `process.hrtime`；浏览器 JIT 与它同量级。要自己复算：`node bench.mjs`。
+
+---
+
+## 六、已知风险
 
 - **两枚读数**：与内置 pill 并存时，一枚 `99%`、一枚 `99.87%`。这是 slot 模型的硬约束，不是 bug（见《能力边界》）。
 - **投影未桥接不渲染**：`tokenUsage` 缺失或 `cacheReadTokens` 非数字时返回 `null`，不崩、不占位。

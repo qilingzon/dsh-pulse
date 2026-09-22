@@ -133,6 +133,19 @@ window.__ModuleLoader__.load({
       return rate >= 10 ? String(Math.round(rate)) : String(Math.round(rate * 10) / 10);
     }
 
+    /**
+     * 本帧「会被看到的东西」的指纹：流式态带 ~ 前缀，无输出为 idle。
+     * 采样循环拿它和上一帧比 —— 值没变就不 setState，空闲时渲染次数为 0。
+     * 采样本身不停（10 秒窗必须持续滑动），但一次采样只是几十个数字的算术。
+     */
+    function displayKey(state, now, streaming) {
+      var slope = windowSlope(state.samples, now, streaming ? "est" : "exact", WINDOW_MS, MIN_SPAN_MS);
+      if (slope === null || !(slope.rate > 0)) return "idle";
+      var rate = formatRate(slope.rate);
+      if (rate === null) return "idle";
+      return (streaming ? "~" : "") + rate;
+    }
+
     /** 标定 chars/token：步骤结算后用「本步精确 tokens ÷ 本步字符数」重算，越界则保持旧值。 */
     function calibrateRatio(chars, tokens, previous) {
       if (!(chars > 0) || !(tokens > 0)) return previous;
@@ -184,6 +197,7 @@ window.__ModuleLoader__.load({
         stepPeakChars: 0,
         estTokens: 0,
         lastNow: 0,
+        renderedKey: "",
         sessionStats: undefined,
         usage: undefined,
         partial: null
@@ -415,10 +429,16 @@ window.__ModuleLoader__.load({
       react.useEffect(function () {
         var id = setInterval(function () {
           var state = meterRef.current;
+          var now = Date.now();
           var exact = exactOutputTokens(state.sessionStats, state.usage);
           var streaming = state.partial !== null && state.partial !== undefined;
-          stepMeter(state, Date.now(), exact, liveChars(state.partial), streaming);
-          setTick(function (n) { return n + 1; });
+          stepMeter(state, now, exact, liveChars(state.partial), streaming);
+          // 值没变就不重渲：空闲时采样照跑（窗要滑动），但一帧都不出。
+          var next = displayKey(state, now, streaming);
+          if (next !== state.renderedKey) {
+            state.renderedKey = next;
+            setTick(function (n) { return n + 1; });
+          }
         }, SAMPLE_MS);
         return function () {
           clearInterval(id);
@@ -507,6 +527,7 @@ window.__ModuleLoader__.load({
       stepMeter: stepMeter,
       windowSlope: windowSlope,
       formatRate: formatRate,
+      displayKey: displayKey,
       calibrateRatio: calibrateRatio,
       estimateTokens: estimateTokens,
       liveChars: liveChars,
