@@ -76,6 +76,45 @@ ok(el.props["data-pulse-src"] === "idle", `空闲态 data-pulse-src = ${el.props
 ok(el.props["data-pulse-step-tps"] === "na", "空闲态本步真值探针 = na");
 ok(el.props["data-pulse-rates"].split(",").length === 5, `五类标定探针初始就是先验五值：${el.props["data-pulse-rates"]}`);
 
+// ---- 2b. v0.6.0 阴影：生效时不再画缓存命中（避免「99% + 99.87%」两枚读数） ----
+T.shadowState.active = true;
+const shadowed = T.PulseDock(idleProps);
+ok(shadowed !== null && shadowed.children.length === 1,
+  `阴影生效 → 只剩 tok/s 一枚 pill（实得 ${shadowed === null ? "null" : shadowed.children.length} 枚）`);
+ok(shadowed.props["data-pulse-shadow"] === "on", `阴影态 data-pulse-shadow = ${shadowed.props["data-pulse-shadow"]}`);
+ok(shadowed.children[0].props.title.includes("无输出") || shadowed.children[0].props.title.includes("tok/s"),
+  "留下的是 tok/s pill");
+T.shadowState.active = false;
+ok(el.children.length === 2, "阴影关闭 → 恢复两枚（老版本 harness 的降级路径）");
+ok(el.props["data-pulse-shadow"] === "off", `降级态 data-pulse-shadow = ${el.props["data-pulse-shadow"]}`);
+
+// ---- 2c. 阴影组件本体：真装载 + 假 React（无 memo / 无 useMemo 的退化路径） ----
+const Shadow = T.createStatsShadow(react);
+const ORIGINAL = function StatsPills() {};
+const shadowEl = Shadow({
+  Original: ORIGINAL,
+  useProjection: (k) => (k === "tokenUsage" ? USAGE : undefined),
+  t: (key, params) => key + "|" + JSON.stringify(params || null),
+  sessionId: "s9"
+});
+ok(shadowEl.type === ORIGINAL, "阴影组件渲染原组件本体（统计行其余内容逐字不变）");
+ok(shadowEl.props.t("stats.cacheHit", { percent: "87" }) === 'stats.cacheHit|{"percent":"87.43"}',
+  `stats.cacheHit 被换成两位小数：${shadowEl.props.t("stats.cacheHit", { percent: "87" })}`);
+ok(shadowEl.props.t("stats.steps", { n: 4 }) === 'stats.steps|{"n":4}', "其它 i18n key 透传");
+ok(shadowEl.props.sessionId === "s9" && shadowEl.props.Original === undefined, "slot props 转发，Original 不外传");
+
+// 带 memo / useMemo 的 React 形状也要能跑（真浏览器走这条）
+const reactFull = { ...react, useMemo: (fn) => fn(), memo: (c) => c };
+const ShadowFull = T.createStatsShadow(reactFull);
+const fullEl = ShadowFull({
+  Original: ORIGINAL,
+  useProjection: (k) => (k === "tokenUsage" ? USAGE : undefined),
+  t: (key, params) => key + "|" + JSON.stringify(params || null)
+});
+ok(fullEl.props.t("stats.cacheHit", {}) === 'stats.cacheHit|{"percent":"87.43"}', "React.memo + useMemo 路径同样拦截成功");
+ok(T.createStatsShadow(react)({ Original: null, useProjection: () => USAGE, t: () => "x" }) === null,
+  "拿不到原组件 → 整枚不渲染（宁可少一枚，也不弄坏 dock）");
+
 // ---- 3. 无缓存数据 + 无速度 → 整条 dock 不渲染（不留空 pill） ----
 const bare = T.PulseDock({ t: seatMiss, useProjection: () => undefined, useChat: () => null });
 ok(bare === null, "两个数据源都缺 → 返回 null（不占位）");

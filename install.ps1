@@ -39,14 +39,13 @@ if ($Remove) {
   foreach ($p in $Profiles) {
     $pj = Join-Path $DshHome "profiles\$p\package.json"
     if (-not (Test-Path $pj)) { Write-Output "[WARN] 无 $pj"; continue }
-    $q = '"' + $id + '"'
-    $c = [System.IO.File]::ReadAllText($pj, [System.Text.Encoding]::UTF8)
-    $c2 = $c.Replace($q + ': "file:../../plugins/' + $id + '",', '').Replace(', ' + $q, '').Replace($q, '')
-    if ($c2 -ne $c) {
-      Copy-Item $pj ($pj + '.bak-' + (Get-Date -Format 'yyyyMMdd-HHmmss')) -Force
-      [System.IO.File]::WriteAllText($pj, $c2, $utf8)
-      Write-Output "[OK] $p package.json 已摘除（文件级替换；跑一次 pnpm install 收敛 node_modules）"
-    } else { Write-Output "[i] $p package.json 未含本插件" }
+    Copy-Item $pj ($pj + '.bak-' + (Get-Date -Format 'yyyyMMdd-HHmmss')) -Force
+    # JSON 语义删除（不是文本替换）：文本替换删不掉「逗号该不该留」，
+    # 2026-09-22 实测会产出 `,"dsh-cachehit-2dp",,"dsh-pulse"]` 这种双逗号非法 JSON，
+    # 导致 pnpm install 退出码 1。详见 profile-edit.cjs 顶部注释。
+    $chk = & node (Join-Path $src 'profile-edit.cjs') remove $pj $id 2>&1
+    if ($LASTEXITCODE -ne 0) { Write-Output "[FAIL] $p package.json 摘除失败: $chk"; exit 1 }
+    Write-Output "[OK] $p $chk"
   }
   Write-Output "[完成] 重启 profile 生效。"
   exit 0
@@ -99,27 +98,29 @@ foreach ($t in $targets) {
 if ($bad -gt 0) { Write-Output "[FAIL] 回读不符 $bad 处 —— 请重跑或回滚 .bak-*"; exit 1 }
 Write-Output '[OK] 三处解析位逐字节一致'
 
-# profile 注册（dependencies + dsh.profile.bundles）
+# profile 注册（dependencies + dsh.profile.bundles）—— 同样走 JSON 语义编辑
 foreach ($p in $Profiles) {
   $pj = Join-Path $DshHome "profiles\$p\package.json"
   if (-not (Test-Path $pj)) { Write-Output "[WARN] 无 $pj —— 跳过注册"; continue }
-  $c = [System.IO.File]::ReadAllText($pj, [System.Text.Encoding]::UTF8)
-  if ($c.Contains('"' + $id + '"')) { Write-Output "[i] $p 已含 $id（幂等跳过）"; continue }
+  $c0 = [System.IO.File]::ReadAllText($pj, [System.Text.Encoding]::UTF8)
+  if ($c0.Contains('"' + $id + '"')) { Write-Output "[i] $p 已含 $id（幂等跳过）"; continue }
   Copy-Item $pj ($pj + '.bak-' + (Get-Date -Format 'yyyyMMdd-HHmmss')) -Force
   $bakPj = (Get-ChildItem ($pj + '.bak-*') | Sort-Object Name -Descending | Select-Object -First 1).FullName
-  $dep = '"' + $id + '": "file:../../plugins/' + $id + '",'
-  $c2 = $c -replace '("dependencies"\s*:\s*\{)', ('$1' + "`r`n    " + $dep)
-  $bundle = '"' + $id + '"'
-  $c3 = $c2 -replace '(?s)("bundles"\s*:\s*\[)(.*?)(\])', ('$1$2,' + $bundle + '$3')
-  [System.IO.File]::WriteAllText($pj, $c3, $utf8)
-  # JSON 合法性闸门：不合法立即回滚该 profile 的 package.json
-  $chk = & node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));const b=(j.dsh&&j.dsh.profile&&j.dsh.profile.bundles)||[];const d=j.dependencies||{};console.log('OK bundles='+b.length+' dep='+(d['$id']||'MISSING'))" $pj 2>&1
+  $spec = 'file:../../plugins/' + $id
+  $chk = & node (Join-Path $src 'profile-edit.cjs') add $pj $id $spec 2>&1
   if ($LASTEXITCODE -ne 0) {
     Copy-Item $bakPj $pj -Force
-    Write-Output "[FAIL] $p package.json 补丁后 JSON 非法（已回滚）: $chk"
+    Write-Output "[FAIL] $p package.json 注册失败（已回滚）: $chk"
     exit 1
   }
-  Write-Output "[OK] $p package.json 已注册（备份保留）: $chk"
+  # JSON 合法性闸门：写回后必须还能被 JSON.parse 且确实含本插件
+  $gate = & node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));const b=(j.dsh&&j.dsh.profile&&j.dsh.profile.bundles)||[];const d=j.dependencies||{};console.log('OK bundles='+b.length+' dep='+(d['$id']||'MISSING'))" $pj 2>&1
+  if ($LASTEXITCODE -ne 0) {
+    Copy-Item $bakPj $pj -Force
+    Write-Output "[FAIL] $p package.json 补丁后 JSON 非法（已回滚）: $gate"
+    exit 1
+  }
+  Write-Output "[OK] $p package.json 已注册（备份保留）: $chk / $gate"
 }
 
 Write-Output ''

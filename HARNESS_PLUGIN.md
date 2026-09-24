@@ -13,8 +13,8 @@
      **两条线**的曲线，消除「一次性 usage 上报被当成瞬时吞吐」的假尖峰。
 - `index.js`（宿主半部）—— **故意为空**：本插件没有宿主侧贡献（不注入提示词、不注册服务、不落盘）。
 - `cordis.patch.yml` —— bundle 行：`insert: [{ id: pulse, name: dsh-pulse }]`。
-- `verify.mjs` —— 语法 + formatter 行为断言 + 滑窗算术 + 五类标定 + 持久化 + 注册面静态核对（154 条）。
-- `smoke.mjs` —— 组件层冒烟：真装载 `client.js`，假 React 下渲染 `PulseDock`（33 条）。
+- `verify.mjs` —— 语法 + formatter 行为断言 + 滑窗算术 + 五类标定 + 持久化 + 注册面静态核对（200 条）。
+- `smoke.mjs` —— 组件层冒烟：真装载 `client.js`，假 React 下渲染 `PulseDock`（44 条）。
 - `bench.mjs` —— 性能实测：每拍开销 / 字符重数 / 常驻内存 / 发布体积。
 - `TEST_COVERAGE.md` —— 测试覆盖矩阵：六层测试的覆盖/边界/未测项（回答「全面吗」以此为准）。
 - `install.sh` / `install.ps1` —— Linux 与 Windows 两套等价安装器（三处解析位 + profile 注册 + 备份 + 回读 + JSON 回滚）。
@@ -31,7 +31,7 @@
 | 项 | 值 |
 |---|---|
 | 包名 / `dsh.id` | `dsh-pulse`（**name == 注册 id**，规避 B23） |
-| 版本 | `0.5.0` |
+| 版本 | `0.6.0` |
 | 平台 | `client.platform: web`，`immediately: true` |
 | 依赖 | 仅 `react`（由 `require("react")` 从宿主取） |
 | 注入 | `slots`、`locale` |

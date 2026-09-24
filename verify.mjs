@@ -1,6 +1,6 @@
 // verify.mjs — dsh-pulse 自证：语法 + 抽取 formatter/window 区做行为断言 + 注册面静态核对
 // 用法：node verify.mjs     （与 cwd 无关）
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -378,6 +378,177 @@ ok(/exports\.inject = inject/.test(src) && /exports\.apply = apply/.test(src), "
 ok(!/document\.|window\.document|querySelector|getElementById/.test(src), "不碰 DOM / 不引用产品选择器");
 ok(!/ctx\.remote|host\.call|harness\./.test(src), "不走宿主 RPC（纯读投影）");
 ok(!/fetch\(|XMLHttpRequest/.test(src), "不发网络请求（分词器 / 词表一律不下载）");
+
+console.log("=== 5. v0.6.0 slot 阴影（纯函数 + 假 ctx 注册） ===");
+{
+  // client.js 是给 ModuleLoader 的 bundle，不是 ESM：用假 window 装载后取 factory。
+  const captured = {};
+  new Function("window", src)({ __ModuleLoader__: { load: (c) => { captured.config = c; } } });
+  const mod = captured.config.factory((name) => (name === "react" ? { createElement: () => null } : undefined));
+  const X = mod.__test;
+
+  const OriginalComp = function OriginalComp() {};
+  const fakeReact = {
+    createElement: (type, props) => ({ type, props: props || {} }),
+    useMemo: (fn) => fn(),
+    memo: (c) => c
+  };
+  const USAGE = { cacheReadTokens: 8743, uncachedInputTokens: 1257, cacheWriteTokens: 0 };
+
+  // --- 5.1 isComponentType ---
+  ok(X.isComponentType(function () {}) === true, "isComponentType(函数) = true");
+  ok(X.isComponentType({ $$typeof: Symbol("react.memo") }) === true, "isComponentType(React.memo 产物) = true");
+  ok(X.isComponentType({}) === false && X.isComponentType(null) === false && X.isComponentType(42) === false,
+    "isComponentType(普通对象 / null / 数字) = false");
+
+  // --- 5.2 findStatsEntry ---
+  const realStats = { options: { id: "stats", order: 0 }, component: OriginalComp };
+  const otherEntry = { options: { id: "pulse", order: 1 }, component: OriginalComp };
+  const shadowEntry = { options: { id: "stats", order: 0, priority: -1 }, component: OriginalComp };
+  const noComp = { options: { id: "stats", order: 0 } };
+  ok(X.findStatsEntry([otherEntry, realStats]) === realStats, "findStatsEntry 跳过别的 id，找到内置 stats（priority 缺省 = 0）");
+  ok(X.findStatsEntry([shadowEntry, realStats]) === realStats, "findStatsEntry 不会把已有的阴影（priority -1）当成内置那枚");
+  ok(X.findStatsEntry([noComp]) === null, "没有 component 的条目不算（拿不到原组件就不阴影）");
+  ok(X.findStatsEntry([]) === null && X.findStatsEntry(null) === null, "空 / null 列表 → null（不崩）");
+
+  // --- 5.3 nextShadowPriority ---
+  ok(X.nextShadowPriority([]) === -1, "无同 id 条目 → -1（低于内置的 0）");
+  ok(X.nextShadowPriority([realStats]) === -1, "只有内置（0）→ -1");
+  ok(X.nextShadowPriority([realStats, shadowEntry]) === -2, "已有一枚阴影（-1）→ -2（不会撞 priority 抛错）");
+  ok(X.nextShadowPriority([otherEntry]) === -1, "只按 id === stats 计算，别的 id 不参与");
+
+  // --- 5.4 阴影组件：拦截 t，其余透传 ---
+  const Shadow = X.createStatsShadow(fakeReact);
+  const el = Shadow({
+    Original: OriginalComp,
+    useProjection: (k) => (k === "tokenUsage" ? USAGE : undefined),
+    t: (key, params) => key + "|" + JSON.stringify(params || null),
+    sessionId: "s1",
+    useChat: function () {}
+  });
+  ok(el.type === OriginalComp, "阴影组件渲染的是原组件本体（不是重写一份统计行）");
+  ok(el.props.t("stats.cacheHit", { percent: "99" }) === 'stats.cacheHit|{"percent":"87.43"}',
+    `stats.cacheHit 被换成两位小数：${el.props.t("stats.cacheHit", { percent: "99" })}`);
+  ok(el.props.t("stats.turns", { n: 3 }) === 'stats.turns|{"n":3}', "其它 key 逐字透传（轮次/步骤/耗时/TTFT/token 显示不变）");
+  ok(el.props.sessionId === "s1" && typeof el.props.useChat === "function", "slot props 原样转发给原组件");
+  ok(el.props.Original === undefined, "Original 不再往下传（原组件不需要知道自己被阴影了）");
+  ok(el.props.useProjection !== undefined, "useProjection 转发（原组件可能也要用）");
+
+  const elNoUsage = Shadow({
+    Original: OriginalComp,
+    useProjection: () => undefined,
+    t: (key, params) => key + "|" + JSON.stringify(params || null)
+  });
+  ok(elNoUsage.props.t("stats.cacheHit", { percent: "99" }) === 'stats.cacheHit|{"percent":"99"}',
+    "拿不到 tokenUsage → 原样透传（不把 null 塞进 percent）");
+  ok(Shadow({ Original: null, useProjection: () => USAGE, t: () => "x" }) === null, "拿不到原组件 → 整枚不渲染（宁可少一枚，也不弄坏 dock）");
+  ok(Shadow({ Original: OriginalComp, useProjection: () => USAGE, t: null }) === null, "拿不到 t → 整枚不渲染");
+
+  // --- 5.5 ensureStatsShadow：假 ctx 注册 ---
+  const makeCtx = (opts) => {
+    const registered = [];
+    const entries = opts.entries || [];
+    return {
+      registered,
+      slots: {
+        // 用「有没有传 specValue」而不是「spec 是不是 undefined」来区分 ——
+        // 否则想测 spec 返回 undefined 时会被默认值吃掉。
+        spec: () => (Object.prototype.hasOwnProperty.call(opts, "specValue")
+          ? opts.specValue
+          : { kind: "list", scope: "session" }),
+        entries: opts.noEntriesApi ? undefined : () => entries,
+        register: (options, component) => {
+          if (opts.throwOnRegister) throw new Error("priority collision");
+          registered.push({ options, component });
+          return () => { registered.length = 0; };
+        }
+      }
+    };
+  };
+
+  X.shadowState.active = false;
+  const ctxA = makeCtx({ entries: [realStats] });
+  const handleA = { current: null, component: Shadow };
+  ok(X.ensureStatsShadow(ctxA, handleA) === true, "阴影注册成功 → 返回 true");
+  ok(ctxA.registered.length === 1, "只注册一枚");
+  const regA = ctxA.registered[0].options;
+  ok(regA.id === "stats" && regA.priority === -1 && regA.order === 0,
+    `注册参数 id=stats / priority=-1 / order=0，实得 id=${regA.id} priority=${regA.priority} order=${regA.order}`);
+  ok(regA.name === "conversation.composer.dock", "注册在 composer dock 上");
+  ok(regA.locale === "chat", `内置没声明 locale 时回退 "chat"（复用内置 i18n 命名空间），实得 ${regA.locale}`);
+  ok(regA.inject().Original === OriginalComp, "inject 把原组件注入给阴影组件");
+  ok(X.shadowState.active === true, "注册成功后 shadowState.active = true");
+  ok(X.ensureStatsShadow(ctxA, handleA) === true && ctxA.registered.length === 1, "重复调用不重复注册（幂等）");
+
+  X.shadowState.active = false;
+  const ctxLocale = makeCtx({ entries: [{ options: { id: "stats", order: 0, locale: "chat" }, component: OriginalComp }] });
+  X.ensureStatsShadow(ctxLocale, { current: null, component: Shadow });
+  ok(ctxLocale.registered[0].options.locale === "chat", "内置声明了 locale → 原样复用");
+
+  X.shadowState.active = false;
+  const ctxNoSpec = makeCtx({ entries: [realStats], specValue: undefined });
+  ok(X.ensureStatsShadow(ctxNoSpec, { current: null, component: Shadow }) === false && ctxNoSpec.registered.length === 0,
+    "slot 未声明（spec === undefined）→ 不注册（加载顺序早于内置时不炸）");
+  ok(X.shadowState.active === false, "未注册时 shadowState.active 保持 false → PulseDock 走降级路径");
+
+  X.shadowState.active = false;
+  const ctxNoApi = makeCtx({ entries: [realStats], noEntriesApi: true });
+  ok(X.ensureStatsShadow(ctxNoApi, { current: null, component: Shadow }) === false && ctxNoApi.registered.length === 0,
+    "老版本 harness 没有 slots.entries → 不注册（降级路径）");
+
+  X.shadowState.active = false;
+  const ctxThrow = makeCtx({ entries: [realStats], throwOnRegister: true });
+  ok(X.ensureStatsShadow(ctxThrow, { current: null, component: Shadow }) === false,
+    "register 抛错（priority 撞车）→ 被吞掉并降级，绝不抛给宿主");
+  ok(X.shadowState.active === false, "抛错后 shadowState.active 保持 false");
+
+  X.shadowState.active = false;
+  ok(X.ensureStatsShadow({}, { current: null, component: Shadow }) === false, "ctx 没有 slots → 不注册（不崩）");
+  ok(X.ensureStatsShadow(null, { current: null, component: Shadow }) === false, "ctx 为 null → 不注册（不崩）");
+  X.shadowState.active = false;
+}
+
+console.log("=== 6. 注册面静态核对（v0.6.0 阴影） ===");
+ok(/"data-pulse-shadow"/.test(src), "带 data-pulse-shadow 探针（CDP 可判定阴影是否生效）");
+ok(/priority: nextShadowPriority\(entries\)/.test(src), "阴影注册使用协商出的更低 priority");
+ok(/inject: function \(\) \{ return \{ Original: original\.component \}; \}/.test(src), "用 inject 把原组件交给阴影组件");
+ok(/shadowState\.active/.test(src) && /view !== null && !shadowState\.active/.test(src),
+  "阴影生效时不重复画缓存命中（避免两枚读数）");
+ok(/typeof slots\.register !== "function" \|\| typeof slots\.entries !== "function" \|\| typeof slots\.spec !== "function"/.test(src),
+  "缺 slots API → 走降级路径（老版本 harness）");
+ok(/\} catch \(e\) \{\s*\/\/[^\n]*\n\s*handleRef\.current = null;\s*shadowState\.active = false;\s*return false;\s*\}/.test(src),
+  "注册抛错被吞掉并降级（catch 里清 handle + 复位 active + 返回 false），不抛给宿主");
+
+console.log("=== 7. 发布文件编码（BOM 会让 profile 加载器硬失败） ===");
+{
+  // 2026-09-22 实测：package.json 带上 UTF-8 BOM 后，dsh 的 profile 加载器直接崩：
+  //   SyntaxError: Unexpected token '锘?, "锘縶\n"name"... is not valid JSON
+  //   at loadProfileDirectory (dsh-app-boot/lib/index.js:866)
+  // 同一类问题在 v0.4.0 已在 install.ps1 上踩过一次（Windows PowerShell 5.1 按 ANSI 读）。
+  // 这条断言把它钉死：**JSON 文件一律不许带 BOM**。
+  const jsonFiles = ["package.json"];
+  for (const f of jsonFiles) {
+    const buf = readFileSync(join(BASE, f));
+    const bom = buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf;
+    ok(!bom, `${f} 无 BOM（有 BOM 时 dsh profile 加载器 JSON.parse 会硬失败）`);
+    try {
+      JSON.parse(buf.toString("utf8").replace(/^\uFEFF/, ""));
+      ok(true, `${f} 可被 JSON.parse`);
+    } catch (e) {
+      ok(false, `${f} JSON.parse 失败：${e.message}`);
+    }
+  }
+  // ps1 反过来必须有 BOM —— Windows PowerShell 5.1 否则按 ANSI 读中文注释而解析失败。
+  // 2026-09-22 实测：**用 edit 工具改过的 .ps1 会丢 BOM**，v0.4.0 加的 BOM 就是这么丢的，
+  // 结果安装器自己解析失败。所以这里扫描仓库里**所有** .ps1，而不是只盯已知的两个。
+  const ps1Files = readdirSync(BASE).filter((f) => f.toLowerCase().endsWith(".ps1"));
+  ok(ps1Files.length >= 2, `仓库里有 ${ps1Files.length} 个 .ps1（至少 install.ps1 / uninstall.ps1）`);
+  for (const f of ps1Files) {
+    const buf = readFileSync(join(BASE, f));
+    const bom = buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf;
+    ok(bom, `${f} 带 UTF-8 BOM（Windows PowerShell 5.1 需要；edit 工具改过会丢，必须复检）`);
+  }
+}
 
 console.log("");
 console.log(fail === 0 ? "VERIFY-OK（全部断言通过）" : `VERIFY-FAILED（${fail} 项不通过）`);

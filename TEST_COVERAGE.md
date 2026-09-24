@@ -8,8 +8,8 @@
 
 | 层 | 手段 | 状态 |
 |---|---|---|
-| L1 纯函数 | `node verify.mjs`（**154 条断言**） | ✅ 全绿 |
-| L2 组件渲染 | `node smoke.mjs`（**33 条断言**，真装载 client.js + 假 React） | ✅ 全绿 |
+| L1 纯函数 | `node verify.mjs`（**200 条断言**） | ✅ 全绿 |
+| L2 组件渲染 | `node smoke.mjs`（**44 条断言**，真装载 client.js + 假 React） | ✅ 全绿 |
 | L3 安装器 | 假 DSH home 上实测 install / 幂等重跑 / remove；`install.ps1` 过 PS 5.1 解析 | ✅ 通过 |
 | L4 真实浏览器 | gen4-lab 实机，**三轮不同文体**（含一轮多步 + 工具调用），产品 `decodeTokens` 为权威值 | ✅ 关键路径通过 |
 | L5 性能 | `node bench.mjs`（每拍 / 字符重数 / 缓冲 / 体积） | ✅ 数字可复算 |

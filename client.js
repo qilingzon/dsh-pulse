@@ -1,7 +1,15 @@
 /* dsh-pulse · client half
- * 在 composer dock 增加两枚只读读数：
- *   1) 「缓存命中 99.87%」两位小数读数（含精确 token 明细 title）；
- *   2) 「42.7 tok/s」10 秒滑窗平均输出速度。
+ * 在 composer dock 做两件事：
+ *   1) 用 slot 阴影**顶替**内置统计行，把「缓存命中」换成两位小数（v0.6.0）；
+ *   2) 另加一枚只读的「10 秒滑窗平均输出速度 tok/s」读数。
+ *
+ * v0.6.0 的阴影（本插件最重要的一次架构变化）：
+ *   同 id "stats" + 更低的 priority 注册一个阴影条目 → 顶替内置那枚；
+ *   阴影组件把原组件 `Original` 原样渲染（轮次/步骤/耗时/TTFT/token 全不变），
+ *   只把 `t` 换成拦截版，把 `stats.cacheHit` 的 percent 改成两位小数。
+ *   **页面上因此只有一枚缓存命中读数**，而不是 v0.5.0 的「99% + 99.87%」两枚。
+ *   阴影不可用（老版本 harness / 注册失败）时自动降级：本插件补上自己那一枚。
+ *   机制与源码证据见 TECHNIQUES.md。
  *
  * 速度读数的两条数据线（口径写死在 title 里，不混报）：
  *   精确线 —— sessionStats.decodeTokens 的墙钟斜率。该计数只在 assistant/message 落盘
@@ -11,13 +19,11 @@
  *             的实时文本增量，按五类字符的在线标定折算；显示为 `~42.1 tok/s` + 虚线降透明。
  *             步骤一结算，估算线立刻收敛回精确线（同一根累计曲线，不会跳变）。
  *
- * v0.5.0「精确速度」相对 v0.4.x 的三处改动：
- *   1) 估计 / 真值视觉分离：`~` vs `✓`、虚线 vs 实线，并新增 data-pulse-src 探针
- *      （estimate | exact | idle），外部脚本可判定当前读数的真伪。
- *   2) 每个步骤结算瞬间同时给出「本步真值速率」（provider 精确产出 ÷ 首 token→结算的墙钟），
- *      写进 tooltip 与 data-pulse-step-tps —— 不依赖 10 秒窗，结算即可见。
+ * v0.5.0 引入的三件事（保留）：
+ *   1) 估计 / 真值视觉分离：`~` vs `✓`、虚线 vs 实线，并新增 data-pulse-src 探针。
+ *   2) 每个步骤结算瞬间给出「本步真值速率」，写进 tooltip 与 data-pulse-step-tps。
  *   3) 五类字符（CJK/字母/数字/标点/空白）带岭先验的在线最小二乘标定，按模型 id
- *      持久化到 localStorage：新会话第一步就带校准，不再吃种子误差。
+ *      持久化到 localStorage；结算时两条线共用同一条重建曲线（消除阶跃假尖峰）。
  *
  * 物理边界（源码核对，2026-09-22）：流式进行中拿不到真值 token 数。
  *   - 唯一来源是 provider 的 usage.outputTokens，见 dsh-session-stats 的 projection：
@@ -97,6 +103,147 @@ window.__ModuleLoader__.load({
         }
       }
       return `99.${"9".repeat(distinguishingPlaces - 1)}${10 - roundedLoss}`;
+    }
+    // #endregion
+
+    // #region shadow
+    // v0.6.0：用 slot 阴影**顶替**内置统计行，把缓存命中换成两位小数。
+    //
+    // 这推翻了 v0.5.0 之前 README《二、能力边界》的结论（「list 型没有可顶替的席位」）。
+    // 源码证据（dsh-client-ui-slots/lib/index.js）：
+    //   L130  list 型按 (priority ?? 0) 升序、再按 (order ?? 0) 升序排序；
+    //   投影   entriesOfSlot 取每个 cell 的第一个存活条目，list 的 cell = entry.options.id；
+    //   守卫   同 id + 同 priority → 抛错，提示原文 "register at a different priority to shadow it (lowest renders)"；
+    //   内置   { id: "stats", order: 0 }，没有 priority → 默认 0（dsh-client-ui-chat L8349）。
+    // 所以「同 id + 更低 priority」即可胜出；且渲染侧只画胜出者（dsh-client-ui-renderer L850-868），
+    // 落选条目根本不会被渲染 —— 页面上不会出现两枚缓存命中读数。
+    //
+    // 阴影组件把原组件 `Original` 原样渲染（轮次/步骤/耗时/TTFT/token 全部不变），
+    // 只替换 `t`：拦截 `stats.cacheHit`，把 percent 换成我们自己的两位小数实现。
+    // verify.mjs 按本区标记抽取做单测 —— 勿改标记。
+
+    var STATS_SLOT = "conversation.composer.dock";
+    var STATS_ID = "stats";
+    var STATS_KEY = "stats.cacheHit";
+    var STATS_NS_FALLBACK = "chat";
+    var ORIGINAL_PRIORITY = 0;
+
+    /** 阴影是否已接管内置统计行。PulseDock 靠它决定要不要再画一枚缓存命中（降级用）。 */
+    var shadowState = { active: false };
+
+    /** 原组件可能是函数，也可能是 React.memo 的产物（带 $$typeof 的对象）。 */
+    function isComponentType(value) {
+      return typeof value === "function"
+        || (typeof value === "object" && value !== null && value.$$typeof !== undefined);
+    }
+
+    /**
+     * 在原始条目列表里找内置统计行：id === "stats" 且 priority === 0 且有组件。
+     * @returns 条目对象，找不到返回 null。
+     */
+    function findStatsEntry(entries) {
+      if (!entries || typeof entries.length !== "number") return null;
+      for (var i = 0; i < entries.length; i += 1) {
+        var entry = entries[i];
+        if (!entry || !entry.options || !entry.component) continue;
+        if (entry.options.id !== STATS_ID) continue;
+        if ((entry.options.priority === undefined ? ORIGINAL_PRIORITY : entry.options.priority) !== ORIGINAL_PRIORITY) continue;
+        return entry;
+      }
+      return null;
+    }
+
+    /**
+     * 下一个阴影优先级 = 现有同 id 条目的最低 priority - 1。
+     * 取 min 再减一，保证与任何已存在的阴影都不撞（同 id 同 priority 注册会抛错）。
+     */
+    function nextShadowPriority(entries) {
+      var min = ORIGINAL_PRIORITY;
+      if (entries && typeof entries.length === "number") {
+        for (var i = 0; i < entries.length; i += 1) {
+          var entry = entries[i];
+          if (!entry || !entry.options || entry.options.id !== STATS_ID) continue;
+          var priority = entry.options.priority;
+          if (typeof priority === "number" && isFinite(priority) && priority < min) min = priority;
+        }
+      }
+      return min - 1;
+    }
+
+    /**
+     * 造阴影组件。`Original` 由 register 的 inject 注入。
+     * 拦截 `t` 只改 `stats.cacheHit`；其余 key 一律透传，所以原统计行的
+     * 轮次 / 步骤 / 耗时 / TTFT / token 显示逐字不变。
+     */
+    function createStatsShadow(react) {
+      function StatsShadow(props) {
+        var Original = props.Original;
+        var useProjection = props.useProjection;
+        var t = props.t;
+        var usage = typeof useProjection === "function" ? useProjection("tokenUsage") : undefined;
+        var view = computeView(usage);
+        var percent = view === null ? null : view.percent;
+
+        var patchedT = typeof react.useMemo === "function"
+          ? react.useMemo(function () {
+            return function (key, params) {
+              if (key !== STATS_KEY || percent === null) return typeof t === "function" ? t(key, params) : key;
+              return typeof t === "function" ? t(key, { percent: percent }) : percent;
+            };
+          }, [t, percent])
+          : function (key, params) {
+            if (key !== STATS_KEY || percent === null) return typeof t === "function" ? t(key, params) : key;
+            return typeof t === "function" ? t(key, { percent: percent }) : percent;
+          };
+
+        // 拿不到原组件 / 拿不到 t 就整枚不渲染（宁可少一枚读数，也不弄坏 dock）。
+        if (!isComponentType(Original)) return null;
+        if (typeof t !== "function") return null;
+
+        var forwarded = {};
+        for (var name in props) {
+          if (!Object.prototype.hasOwnProperty.call(props, name)) continue;
+          if (name === "Original" || name === "t") continue;
+          forwarded[name] = props[name];
+        }
+        forwarded.useProjection = useProjection;
+        forwarded.t = patchedT;
+        return react.createElement(Original, forwarded);
+      }
+      return typeof react.memo === "function" ? react.memo(StatsShadow) : StatsShadow;
+    }
+
+    /**
+     * 尝试注册阴影。幂等：已注册或环境不支持时直接返回。
+     * @returns true 表示阴影已生效（或本次注册成功）。
+     */
+    function ensureStatsShadow(ctx, handleRef) {
+      var slots = ctx && ctx.slots;
+      if (!slots || handleRef.current !== null) return shadowState.active;
+      if (typeof slots.register !== "function" || typeof slots.entries !== "function" || typeof slots.spec !== "function") {
+        return false; // 老版本 harness：没有这三个 API → 走降级路径
+      }
+      try {
+        if (slots.spec(STATS_SLOT) === undefined) return false;
+        var entries = slots.entries(STATS_SLOT);
+        var original = findStatsEntry(entries);
+        if (original === null) return false;
+        handleRef.current = slots.register({
+          name: STATS_SLOT,
+          id: STATS_ID,
+          priority: nextShadowPriority(entries),
+          order: 0,
+          locale: (original.options && original.options.locale) || STATS_NS_FALLBACK,
+          inject: function () { return { Original: original.component }; }
+        }, handleRef.component);
+        shadowState.active = true;
+        return true;
+      } catch (e) {
+        // 注册失败（撞 priority / slot 未声明 / 老版本不认识 inject）→ 降级，不抛给宿主。
+        handleRef.current = null;
+        shadowState.active = false;
+        return false;
+      }
     }
     // #endregion
 
@@ -885,7 +1032,10 @@ var RATE_PRIOR = [0.80, 0.24, 0.30, 0.60, 0.12];
       if (view === null && rate.key === "idle") return null;
 
       var children = [];
-      if (view !== null) {
+      // 阴影生效时内置统计行已经显示两位小数缓存命中 —— 这里绝不能再画一枚，
+      // 否则用户又看到「99% + 99.87%」两枚读数（v0.5.0 的形态）。
+      // 阴影不可用（老 harness / 注册失败）时才由本插件补上这一枚，作为降级。
+      if (view !== null && !shadowState.active) {
         var params = {
           percent: view.percent,
           read: group(view.read),
@@ -939,6 +1089,8 @@ var RATE_PRIOR = [0.80, 0.24, 0.30, 0.60, 0.12];
           "data-pulse-step-tps": stepRateText,
           "data-pulse-rates": meter.rates.join(","),
           "data-pulse-fit-s": String(Math.round(meter.fit.s)),
+          // 阴影是否接管了内置统计行。CDP 实测靠它判定「页面上只剩一枚两位小数缓存命中」。
+          "data-pulse-shadow": shadowState.active ? "on" : "off",
           "data-pulse-exact": meter.lastExact === null || meter.lastExact === undefined ? "na" : String(meter.lastExact),
           "data-pulse-est": String(Math.round(meter.estTokens)),
           "data-pulse-chars": String(meter.lastChars),
@@ -953,6 +1105,28 @@ var RATE_PRIOR = [0.80, 0.24, 0.30, 0.60, 0.12];
         () => ctx.locale.register(NS, { zh: ZH, en: EN }),
         "ui-pulse: dictionaries"
       );
+
+      // 阴影：先同步试一次（第一帧就不会多画一枚缓存命中），再订阅 slot 变化兜住加载顺序。
+      var shadowHandle = { current: null, component: createStatsShadow(react) };
+      ensureStatsShadow(ctx, shadowHandle);
+
+      ctx.effect(function () {
+        var slots = ctx.slots;
+        if (!slots || typeof slots.subscribe !== "function") return undefined;
+        ensureStatsShadow(ctx, shadowHandle);
+        var unsubscribe = slots.subscribe(STATS_SLOT, function () {
+          ensureStatsShadow(ctx, shadowHandle);
+        });
+        return function () {
+          if (typeof unsubscribe === "function") unsubscribe();
+          if (shadowHandle.current !== null) {
+            try { shadowHandle.current(); } catch (e) { /* 卸载失败不影响宿主 */ }
+            shadowHandle.current = null;
+          }
+          shadowState.active = false;
+        };
+      }, "ui-pulse: shadow the built-in stats line (2dp cache hit)");
+
       ctx.slots.inject("conversation.composer.dock", () =>
         ctx.slots.register(
           {
@@ -996,6 +1170,17 @@ var RATE_PRIOR = [0.80, 0.24, 0.30, 0.60, 0.12];
       ensureCalibration: ensureCalibration,
       ratesText: ratesText,
       readModelKey: readModelKey,
+      // v0.6.0 阴影：纯函数部分可单测，注册部分靠假 ctx 单测。
+      isComponentType: isComponentType,
+      findStatsEntry: findStatsEntry,
+      nextShadowPriority: nextShadowPriority,
+      createStatsShadow: createStatsShadow,
+      ensureStatsShadow: ensureStatsShadow,
+      shadowState: shadowState,
+      STATS_SLOT: STATS_SLOT,
+      STATS_ID: STATS_ID,
+      STATS_KEY: STATS_KEY,
+      ORIGINAL_PRIORITY: ORIGINAL_PRIORITY,
       exactOutputTokens: exactOutputTokens,
       readRate: readRate,
       PulseDock: PulseDock

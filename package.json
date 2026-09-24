@@ -1,7 +1,7 @@
 {
   "name": "dsh-pulse",
-  "version": "0.5.0",
-  "description": "客户端插件：在 composer dock 增加两枚只读读数 —— 缓存命中两位小数，以及 10 秒滑窗平均输出速度（tok/s）。速度读数区分「流中估计」与「结算后 provider 真值」两态，按模型持久化五类字符标定。只读投影与实时文本，不改宿主。",
+  "version": "0.6.0",
+  "description": "客户端插件：用 slot 阴影顶替内置统计行，把「缓存命中」显示为两位小数（页面上只留一枚读数）；另加一枚只读的 10 秒滑窗平均输出速度（tok/s），区分流中估计与结算后 provider 真值两态。",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -13,6 +13,7 @@
     "index.js",
     "client.js",
     "cordis.patch.yml",
+    "profile-edit.cjs",
     "install.ps1",
     "uninstall.ps1",
     "install.sh",
@@ -22,6 +23,9 @@
     "HARNESS_PLUGIN.md",
     "README.md",
     "TEST_COVERAGE.md",
+    "TECHNIQUES.md",
+    "ECOSYSTEM.md",
+    "STABILITY.md",
     "LICENSE"
   ],
   "keywords": [
@@ -50,8 +54,8 @@
   },
   "dsh": {
     "id": "dsh-pulse",
-    "name": "缓存命中两位小数 + 精确输出速度",
-    "version": "0.5.0",
+    "name": "缓存命中两位小数（顶替内置）+ 精确输出速度",
+    "version": "0.6.0",
     "repo": "github/qilingzon/dsh-pulse",
     "permissions": "客户端 slot 注册（只读 useProjection，无宿主侧改动）",
     "client": {

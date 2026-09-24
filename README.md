@@ -1,27 +1,42 @@
-# dsh-pulse · 缓存命中两位小数 + 精确输出速度
+# dsh-pulse · 缓存命中两位小数（顶替内置）+ 精确输出速度
 
-> DeepSeek Harness 客户端插件：在 composer dock 增加两枚只读读数 —— **缓存命中两位小数** 与 **10 秒滑窗平均输出速度（tok/s）**。速度读数区分「流中估计」与「结算后 provider 真值」两态。不改产品二进制、可版本化、可卸载。
+> DeepSeek Harness 客户端插件，做两件事：
+> 1. 用 **slot 阴影顶替内置统计行**，把「缓存命中」显示为**两位小数** —— 页面上只留**一枚**读数；
+> 2. 另加一枚只读的 **10 秒滑窗平均输出速度（tok/s）**，区分「流中估计」与「结算后 provider 真值」两态。
 >
-> 仓库：<https://github.com/qilingzon/dsh-pulse> ｜ 许可：MIT ｜ 版本：0.5.0
+> 不改产品二进制、可版本化、可卸载。
 >
-> 前身是本地实验件 `dsh-cachehit-2dp`（A27），本仓库是它的正式发布形态。当时并行的另一条路线是 asar 最小增量补丁（未随仓库发布，仅存于本机实验目录）。两条路线的能力不同，见下面《能力边界》——**先看那张表再选**。
+> 仓库：<https://github.com/qilingzon/dsh-pulse> ｜ 许可：MIT ｜ 版本：0.6.0
+>
+> 前身是本地实验件 `dsh-cachehit-2dp`（A27）。曾经并行的另一条路线是 asar 最小增量补丁 —— v0.6.0 起
+> **不再需要它**（插件路线现在也能做到「就一个数、且是两位小数」，还额外耐升级、可卸载）。
+> 结论与源码证据见《能力边界》与 `TECHNIQUES.md`。
 
 ---
 
 ## 一、它做什么
-
-在 `conversation.composer.dock` 注册两枚**只读** pill：
 
 ```
 缓存命中 99.87%   ~42.7 tok/s     ← 流式进行中：估计值，虚线边
 缓存命中 99.87%   41.8 tok/s ✓    ← 步骤结算后：provider 真值，实线边
 ```
 
-### 1. 缓存命中（两位小数）
+**左边那枚不是新增的** —— 它是被本插件**顶替**的内置统计行（未安装时它显示 `99%`）。
+本插件只贡献右边那枚 tok/s。
 
+### 1. 缓存命中（两位小数，顶替内置）
+
+- **做法**：以同一个 `id: "stats"` + 更低的 `priority` 注册一个**阴影**条目顶替内置那枚，
+  阴影组件把内置组件本体原样渲染，只把 `stats.cacheHit` 的 percent 换成两位小数。
+  轮次 / 步骤 / 耗时 / TTFT / token 等显示**逐字不变**。机制与源码证据见《能力边界》§2.2–2.3。
+- **实测**：gen4-lab 真实 DSH web 上，页面上可见的缓存命中读数**恰好 1 枚**，且为两位小数
+  （证据 `shadow-verify.json`：`shadowActive / exactlyOneCacheHitReading / thatReadingIsTwoDecimal /
+  readingComesFromBuiltinNotPulse` 四项全 `true`）。
 - 数据来自 `useProjection("tokenUsage")` —— 与内置那枚**同一个投影**，不是估算、不是另算一份账。
 - 口径与内置完全一致：`缓存读取 ÷ (未缓存输入 + 缓存读取 + 缓存写入)`；「部分命中绝不显示 100%」的诚实分支逐字同源。
 - `title` / `aria-label` 给出精确明细：`会话累计缓存命中 99.87% ｜ 缓存读取 1,234,567 tok ｜ 未缓存输入 16,234 tok ｜ 缓存写入 0 tok ｜ 计费输入 1,250,801 tok`。
+- **降级**：阴影不可用（老版本 harness / slot 未声明 / 注册抛错）时自动退回「自己补一枚」，
+  此时会出现两枚读数 —— `data-pulse-shadow` 探针报 `off` 即可判定。
 - 不写宿主、不碰 DOM、不引用产品 CSS 类名、不走 RPC、不注册服务。
 
 ### 2. 10 秒滑窗平均输出速度（tok/s）· v0.5.0「精确速度」
@@ -69,27 +84,85 @@
 
 ---
 
-## 二、能力边界：**能加，不能顶替**
+## 二、能力边界：**能顶替，不需要 asar 补丁**
 
-「做成插件，把内置那枚改成两位小数」——**做不到**。三条硬证据（都可回读复核）：
+> ⚠️ **本节在 v0.6.0 被整节重写过。** v0.5.0 及之前这里写的是「做成插件把内置那枚改成两位小数 —— 做不到」，
+> 并据此建议走 asar 补丁路线。**那个结论是错的**，错在把 slot 的 `order` 当成了 `priority`。
+> 详见 `TECHNIQUES.md` §1，下面只列结论与证据。
 
-| # | 证据 | 位置 |
+### 2.1 为什么当初以为做不到（两条仍然成立的事实）
+
+| # | 事实 | 位置 |
 |---|---|---|
-| 1 | **精度在模块内部就定死了，且函数不导出**：`formatCacheHitPercent(cacheReadTokens, promptTokens, decimalPlaces = 0)` 是模块私有；该包只导出 `EMPTY_CHAT_SNAPSHOT / apply / inject / isRunningTool / isSettledTool` —— 插件没有任何可替换的入口 | `@deepseek-ai/dsh-client-ui-chat/lib/client.js:3361`、文件尾 `exports.*` |
-| 2 | **i18n 拿到的是已经四舍五入好的字符串**：内置 pill 走 `t("stats.cacheHit", { percent: cacheHit })`，`{percent}` 已经是 `"99"` —— 就算插件覆盖 `ui-chat` 命名空间的文案，也补不回精度 | 同上 `:4019`、`:2630` |
-| 3 | **slot 是 list 型，没有可顶替的席位**：`conversation.composer.dock` 声明为 `{ kind: "list", scope: "session" }`，`ui-chat` 已用 `id: "stats"` 占位；注册表对 list 型的重复判定是 `id + priority`，换 priority 注册只是**并列多一枚**；渲染侧对 list 型是 `[...rows].sort(by order)` **全量渲染**，不是择优 | `dsh-client-ui-conversation/lib/client.js:16744`、`dsh-client-ui-slots/lib/index.js:91-93`、`dsh-client-ui-renderer/lib/client.js:866` |
+| 1 | **精度在模块内部就定死了，且函数不导出**：`formatCacheHitPercent(cacheReadTokens, promptTokens, decimalPlaces = 0)` 是模块私有；该包只导出 `EMPTY_CHAT_SNAPSHOT / apply / inject / isRunningTool / isSettledTool` | `@deepseek-ai/dsh-client-ui-chat/lib/client.js:3361`、文件尾 `exports.*` |
+| 2 | **i18n 拿到的是已经四舍五入好的字符串**：内置 pill 走 `t("stats.cacheHit", { percent: cacheHit })`，`{percent}` 已经是 `"99"` | 同上 `:4019`、`:2630` |
 
-**取舍表：**
+这两条本身没错 —— 所以**不能改内置组件**。但它们推不出「不能顶替它」。
 
-| 诉求 | 插件（本包） | asar 补丁（本机实验路线，未随仓库发布） |
+### 2.2 真正的情况：list 型 slot 支持阴影
+
+| # | 事实 | 位置（本机 `app.asar` 可复核） |
 |---|---|---|
-| 缓存命中显示到两位小数 | ✅（另加一枚读数） | ✅（直接改内置那枚） |
-| 库里只剩**一个**「缓存命中」读数 | ❌ | ✅ |
+| 1 | list 型条目按 **`(priority ?? 0)` 升序**、再按 `(order ?? 0)` 升序排序 | `dsh-client-ui-slots/lib/index.js` **L130** |
+| 2 | `entriesOfSlot` 取**每个 cell 的第一个存活条目**；**list 的 cell = `entry.options.id`** | 同文件投影实现 |
+| 3 | 注册守卫：同 `id` + 同 `priority` 才抛错，提示原文 `register at a different priority to shadow it (lowest renders)` | 同文件 `register` 的 `case "list"` |
+| 4 | 内置统计行是 `{ id: "stats", order: 0 }`，**没有 `priority`**（默认 0） | `dsh-client-ui-chat/lib/client.js:8349-8354` |
+| 5 | list 渲染只画胜出者，**被阴影的落选条目被 `rowIds.has(...) → continue` 直接跳过** | `dsh-client-ui-renderer/lib/client.js:850-868` |
+
+**结论：`priority` 越低越优先。用同一个 `id: "stats"` + 更低的 `priority` 注册，就能顶替内置那枚，
+而且页面上不会出现第二枚。**
+
+### 2.3 本插件怎么做的（v0.6.0）
+
+```js
+// 找内置那枚（原始条目视图，含被阴影的落选者）
+const original = slots.entries("conversation.composer.dock").find(e =>
+  e.options.id === "stats" && (e.options.priority ?? 0) === 0);
+
+// 同 id + 更低 priority 注册阴影；把原组件 inject 进来
+slots.register({
+  name: "conversation.composer.dock",
+  id: "stats",
+  priority: Math.min(0, ...已有同 id 的 priority) - 1,
+  order: 0,
+  locale: original.options.locale ?? "chat",     // 复用内置 i18n 命名空间
+  inject: () => ({ Original: original.component })
+}, StatsShadow);
+
+// 阴影组件原样渲染内置组件，只把 t 换成拦截版
+function StatsShadow({ Original, useProjection, t, ...props }) {
+  const usage = useProjection("tokenUsage");
+  const view = computeView(usage);               // 本插件的两位小数实现
+  const patchedT = (key, params) =>
+    key !== "stats.cacheHit" || view === null ? t(key, params)
+                                              : t(key, { percent: view.percent });
+  return react.createElement(Original, { ...props, useProjection, t: patchedT });
+}
+```
+
+轮次 / 步骤 / 耗时 / TTFT / token 等显示**逐字不变**（因为渲染的就是内置组件本体），
+只有 `stats.cacheHit` 那一个数字被换成两位小数。
+
+### 2.4 取舍表（重写后）
+
+| 诉求 | 本插件（v0.6.0） | asar 补丁（本机实验路线，未随仓库发布） |
+|---|---|---|
+| 缓存命中显示到两位小数 | ✅（**顶替**内置那枚） | ✅（直接改内置那枚） |
+| 库里只剩**一个**「缓存命中」读数 | ✅（实测：可见读数恰好 1 枚） | ✅ |
 | DSH 升级后仍存活 | ✅ | ❌（升级整体换 asar，补丁消失，需按新版重打） |
 | 需要改产品二进制 / 关闭宿主 | 不需要 | 需要（`app.asar` 被运行中宿主独占） |
 | 可版本化 / 可卸载 / 走《发布标准》 | ✅ | ❌ |
+| 两个阴影插件同时抢 `stats` | ✅ 用 `priority` 递减协商（`min(已存在) - 1`） | — |
 
-> 一句话：**要「就一个数、且是两位小数」→ asar 补丁；要「耐升级、可维护、可卸载」→ 插件。** 两者可并存，但并存会出现两枚读数（`99%` 与 `99.87%`）。
+> 一句话：**两条路线现在都能做到「就一个数、且是两位小数」；插件路线还额外耐升级、可卸载。**
+> asar 补丁路线因此**不再有存在理由**。
+
+### 2.5 降级路径（这条必须留着）
+
+阴影依赖 `ctx.slots.entries` / `spec` / `subscribe` / `register({inject})`。任一不可用
+（老版本 harness、slot 未声明、注册抛错）时，本插件**自动退回 v0.5.0 形态**：
+自己补一枚缓存命中 pill（此时会出现内置 `99%` + 本插件 `99.87%` 两枚）。
+这条路径由 `verify.mjs` 与 `smoke.mjs` 的降级断言覆盖，且 `data-pulse-shadow` 探针会报 `off`。
 
 ---
 
@@ -135,6 +208,18 @@ powershell -ExecutionPolicy Bypass -File uninstall.ps1 -DshHome "C:\Users\you\.d
 
 装完按 B18/B20 的接棒四步收口：`cd <home>/profiles/<profile>` → `pnpm install` → 重启该 profile → **新开对话**（不是刷新旧会话）才见生效。
 
+> ⚠️ **v0.6.0 实测警告：`pnpm install` 这一步有破坏性，不要无脑跑。**
+> 2026-09-22 在真实 `gen4_home` 上走查该步时：profile 里**别的**依赖
+> （`@deepseek-ai/dsh-session`、`@deepseek-ai/dsh-invariants`）把版本范围钉在 `>=0.1.2 <0.2.0-0`，
+> 而 npm 上没有落在这个范围的发布版，于是 `pnpm install` 报 `ERR_PNPM_NO_MATCHING_VERSION` 退出码 1；
+> **pnpm 在失败前已经把 `node_modules` 重建了** —— 该 profile 里其它插件（`@linxin666/dsh-web-all`、
+> `dshmarket` 等）全部消失，profile 直接起不来（`cannot resolve profile bundle`）。
+>
+> **安全做法**：只有当该 profile 的**全部**依赖都能解析时才跑 `pnpm install`。
+> 本插件的三处解析位里，`<home>/node_modules` 与 `<home>/plugins` 两处**不依赖 pnpm**，
+> 只要 profile 的 bundle 注册还在（`install.ps1` 已写），**通常直接重启 profile 就能生效，不需要跑 pnpm**。
+> 完整实测记录与恢复步骤见 `STABILITY.md` §2.1。
+
 三处解析位（一个都不能少，B18/B23 的教训）：
 
 ```
@@ -154,7 +239,7 @@ node bench.mjs    # 性能实测：每拍开销 / 常驻内存 / 发布体积
 npm run harness:test   # verify + smoke 都跑
 ```
 
-### `verify.mjs`（实测，EXIT=0，148 条断言全 PASS）
+### `verify.mjs`（实测，EXIT=0，200 条断言全 PASS）
 
 按 `// #region` 标记把纯算术区从 `client.js` 里抽出来求值做行为断言（不是文本匹配）。节选：
 
@@ -206,7 +291,7 @@ npm run harness:test   # verify + smoke 都跑
 VERIFY-OK（全部断言通过）
 ```
 
-### `smoke.mjs`（实测，EXIT=0，33 条断言全 PASS）
+### `smoke.mjs`（实测，EXIT=0，44 条断言全 PASS）
 
 真装载 `client.js`（走 `window.__ModuleLoader__.load`），用假 React 渲染 `PulseDock`：
 
@@ -329,7 +414,7 @@ SMOKE-OK（组件层全部通过）
 | 3.19 ns/字符 | 9750 字正文重数五类字符，5000 次平均 | v0.5.0 新增项，与正文长度成正比；`charCodeAt` 快路径 |
 | 缓冲恒 41 点 | 20 万拍后复查 `samples.length` | 与平台无关，可靠 |
 | gzip 16.7 KiB | `zlib.gzipSync(level:9)` | 可靠 |
-| 154 + 33 条断言全 PASS | `verify.mjs` / `smoke.mjs` | 断言本身可信；但 smoke 用的是**假 React** |
+| 200 + 44 条断言全 PASS | `verify.mjs` / `smoke.mjs` | 断言本身可信；但 smoke 用的是**假 React** |
 | 0.0063% 单核 | 由上三条按 2 拍/秒折算 | **只算采样算术**，不含渲染 |
 
 > 诚实备注：`bench.mjs` 初版把时间步长写成 1 ms/拍，导致环形缓冲不裁剪、测出「95.58 µs / 20001 点」的退化值。修正为真实 500 ms/拍后才是上面的数字。README 里从未出现过那组错值。
@@ -396,7 +481,7 @@ R3 结算后 0.79884 / 0.21903 / 0.30026 / 0.59815 / 0.11623
 | 首帧延迟、视觉抖动、数字跳动 | 只观察了采样序列，没有逐帧目视。 |
 | **其他模型** | 全部实测都在 `glm-5.3-flash`（lab 默认）上。换模型时前 1~2 步会重新收敛，但**未在第二个模型上验证过**。 |
 | **标点 / 空白 / 数字三类先验** | 汉字 0.80 与字母 0.24 是实测值；标点 0.60 / 空白 0.12 / 数字 0.30 按 tokenizer 行为取值，**没有独立实测**。 |
-| **`pnpm install` 收口步** | lab 从三处解析位副本直接加载成功，该步从未走查。 |
+| **`pnpm install` 收口步** | ✅ **已走查（v0.6.0）** —— 结论是它在本 lab profile 上**跑不通且有破坏性**，见《装 / 卸》的警告框与 `STABILITY.md` §2.1 |
 | **对真实 gen4_home 的 `--remove`** | 只在假 home 执行过。 |
 | **React 真实调度 / 卸载竞态** | smoke 用的是假 React 替身。 |
 | **生产 `C:\Users\qiling\.dsh`** | 按 C10/C11 全程未触碰。 |
