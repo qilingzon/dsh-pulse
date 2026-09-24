@@ -579,18 +579,49 @@ var RATE_PRIOR = [0.80, 0.24, 0.30, 0.60, 0.12];
     /**
      * 取当前模型的标定桶名。`modelSelection` 投影的形状不对外承诺，所以只接受
      * 能直接当短字符串用的字段；认不出就退回全局桶（换模型时前 1~2 步重新收敛）。
+     *
+     * 2026-09-22 源码核对（dsh-client-ui-model-selection/lib/client.js）：
+     * 该投影的实际形状是 `{ current, routable, groups, failures, status, error }`，
+     * 当前模型在 **`current`** 里（`current = projected.next ?? catalog.value.default`），
+     * 而 `current` 带 `provider` 与模型 id。v0.6.0 初版只看了顶层字段，一个都不匹配 →
+     * 一直退回全局桶（实测 localStorage 里只有 `dsh-pulse:cal:v1`，没有按模型的桶）。
+     * 现在优先读 `current`，并把 `provider/model` 拼成稳定的桶名。
      */
     function readModelKey(useProjection) {
       try {
         var selection = typeof useProjection === "function" ? useProjection("modelSelection") : undefined;
+        if (typeof selection === "string") return shortKey(selection);
         if (selection === null || typeof selection !== "object") return "";
+
+        var current = selection.current;
+        if (typeof current === "string") return shortKey(current);
+        if (current !== null && typeof current === "object") {
+          var provider = firstString([current.provider, current.providerId, current.providerName]);
+          var model = firstString([current.model, current.modelId, current.id, current.name]);
+          if (provider !== "" && model !== "") return shortKey(provider + "/" + model);
+          if (model !== "") return shortKey(model);
+        }
+
         var candidates = [selection.rowId, selection.id, selection.modelId, selection.model, selection.selected, selection.value];
         for (var i = 0; i < candidates.length; i += 1) {
-          var value = candidates[i];
-          if (typeof value === "string" && value.length > 0 && value.length <= 64) return value;
+          if (typeof candidates[i] === "string" && candidates[i].length > 0) return shortKey(candidates[i]);
         }
       } catch (e) {
         /* 忽略：退回全局桶 */
+      }
+      return "";
+    }
+
+    /** 桶名只接受可当字符串用的短值，超长一律丢弃（不拿异常形状当桶名）。 */
+    function shortKey(value) {
+      return typeof value === "string" && value.length > 0 && value.length <= 64 ? value : "";
+    }
+
+    /** 取候选里第一个非空短字符串。 */
+    function firstString(candidates) {
+      for (var i = 0; i < candidates.length; i += 1) {
+        var key = shortKey(candidates[i]);
+        if (key !== "") return key;
       }
       return "";
     }
@@ -1091,6 +1122,8 @@ var RATE_PRIOR = [0.80, 0.24, 0.30, 0.60, 0.12];
           "data-pulse-fit-s": String(Math.round(meter.fit.s)),
           // 阴影是否接管了内置统计行。CDP 实测靠它判定「页面上只剩一枚两位小数缓存命中」。
           "data-pulse-shadow": shadowState.active ? "on" : "off",
+          // 标定桶名后缀（空 = 退回全局桶）。换模型是否换桶靠它判定。
+          "data-pulse-bucket": meter.fitKey === CAL_KEY ? "" : meter.fitKey.slice(CAL_KEY.length + 1),
           "data-pulse-exact": meter.lastExact === null || meter.lastExact === undefined ? "na" : String(meter.lastExact),
           "data-pulse-est": String(Math.round(meter.estTokens)),
           "data-pulse-chars": String(meter.lastChars),

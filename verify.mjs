@@ -335,10 +335,20 @@ console.log("=== 3. 10 秒滑窗速率 + v0.5.0 五类标定（抽取 window 区
     ok(ratesText(RATE_PRIOR) === "汉字 0.8 / 字母 0.24 / 数字 0.3 / 标点 0.6 / 空白 0.12", `ratesText 摊开五类：${ratesText(RATE_PRIOR)}`);
 
     // --- 3.8 模型桶解析（形状不承诺，认不出就退回全局） ---
-    ok(readModelKey(() => ({ rowId: "deepseek-official/deepseek-v4-flash" })) === "deepseek-official/deepseek-v4-flash", "modelSelection.rowId → 桶名");
-    ok(readModelKey(() => ({ model: "m1" })) === "m1", "回退字段 model → 桶名");
+    ok(readModelKey(() => ({ rowId: "deepseek-official/deepseek-v4-flash" })) === "deepseek-official/deepseek-v4-flash", "顶层 rowId → 桶名");
+    ok(readModelKey(() => ({ model: "m1" })) === "m1", "顶层 model → 桶名");
+    // 2026-09-22 源码核对：真实形状是 { current, routable, groups, failures, status, error }，
+    // 当前模型在 current 里。v0.6.0 初版漏了这层，实测一直退回全局桶。
+    ok(readModelKey(() => ({ current: { provider: "r4", model: "deepseek-v4.1-flash" }, status: "ready" })) === "r4/deepseek-v4.1-flash",
+      "真实形状：current.provider + current.model → 桶名");
+    ok(readModelKey(() => ({ current: { providerId: "p", modelId: "m" } })) === "p/m", "current 用 providerId/modelId 拼桶名");
+    ok(readModelKey(() => ({ current: { model: "solo" } })) === "solo", "current 只有 model → 用 model 当桶名");
+    ok(readModelKey(() => ({ current: "plain/model" })) === "plain/model", "current 是字符串 → 直接用");
+    ok(readModelKey(() => ({ current: null, groups: [] })) === "", "current 为 null → 空串（退回全局桶，不崩）");
     ok(readModelKey(() => ({ nope: 1 })) === "", "认不出的形状 → 空串（退回全局桶）");
     ok(readModelKey(() => ({ model: "x".repeat(200) })) === "", "超长值 → 空串（不拿异常形状当桶名）");
+    ok(readModelKey(() => ({ current: { provider: "p".repeat(100), model: "m" } })) === "m",
+      "provider 超长被丢弃 → 退回用 model 当桶名（有桶总比全局桶好，且模型名足够区分）");
     ok(readModelKey(() => { throw new Error("no bridge"); }) === "", "投影抛错 → 空串（不崩）");
     ok(readModelKey(undefined) === "", "未桥接 → 空串");
 
