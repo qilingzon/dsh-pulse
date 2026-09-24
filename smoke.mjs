@@ -72,30 +72,39 @@ ok(el.children[1].children[0] === "— tok/s", `无采样时速度 pill = ${JSON
 ok(el.props["data-pulse"] === "87.43", `data-pulse = ${el.props["data-pulse"]}`);
 ok(el.props["data-pulse-tps"] === "idle", `data-pulse-tps = ${el.props["data-pulse-tps"]}`);
 ok(el.props["data-pulse-chars"] === "0" && el.props["data-pulse-units"] === "0", "chars/units 探针初始为 0");
+ok(el.props["data-pulse-src"] === "idle", `空闲态 data-pulse-src = ${el.props["data-pulse-src"]}（真值 / 估计 / 空闲三态可外部判定）`);
+ok(el.props["data-pulse-step-tps"] === "na", "空闲态本步真值探针 = na");
+ok(el.props["data-pulse-rates"].split(",").length === 5, `五类标定探针初始就是先验五值：${el.props["data-pulse-rates"]}`);
 
 // ---- 3. 无缓存数据 + 无速度 → 整条 dock 不渲染（不留空 pill） ----
 const bare = T.PulseDock({ t: seatMiss, useProjection: () => undefined, useChat: () => null });
 ok(bare === null, "两个数据源都缺 → 返回 null（不占位）");
 
-// ---- 4. 速率文案：估算态带 ~、精确态不带 ----
+// ---- 4. 速率文案：估算态带 ~、精确态带 ✓ ----
+const CJK = (n) => [n, 0, 0, 0, 0];
 const mk = (running) => {
   const st = T.createMeterState();
-  T.stepMeter(st, 1000, 0, 0, true);
-  T.stepMeter(st, 2000, 0, 200, true);
-  T.stepMeter(st, 3000, 0, 500, true);
-  T.stepMeter(st, 4000, 600, 0, false);
-  T.stepMeter(st, 5000, 600, 100, true);
+  T.stepMeter(st, 1000, 0, CJK(0), true);
+  T.stepMeter(st, 2000, 0, CJK(200), true);
+  T.stepMeter(st, 3000, 0, CJK(500), true);
+  T.stepMeter(st, 4000, 600, CJK(0), false);
+  T.stepMeter(st, 5000, 600, CJK(100), true);
   return st;
 };
 const estRate = T.readRate(mk(true), 5000, true, seatMiss);
-ok(estRate.text === "~180 tok/s", `流式估算文案 = ${JSON.stringify(estRate.text)}`);
-ok(estRate.key === "180", `data-pulse-tps = ${estRate.key}`);
+ok(estRate.text === "~173 tok/s", `流式估算文案 = ${JSON.stringify(estRate.text)}`);
+ok(estRate.source === "estimate", `流式态 source = ${estRate.source}`);
+ok(estRate.key === "173", `data-pulse-tps = ${estRate.key}`);
 ok(/流式进行中/.test(estRate.title), "估算态 title 明示「流式进行中」");
-ok(/1\.2 tok\/unit/.test(estRate.title), "估算态 title 带标定比（tok/unit 加权口径）");
+ok(/五类标定 汉字 0\.9/.test(estRate.title), `估算态 title 摊开五类标定（结算后 CJK 0.80→0.90）：${estRate.title.slice(0, 120)}`);
+ok(/上次结算真值 300/.test(estRate.title), "估算态 title 带上本步 provider 真值 300 tok/s");
 
 const exRate = T.readRate(mk(false), 5000, false, seatMiss);
-ok(exRate.text === "150 tok/s", `结算后精确文案 = ${JSON.stringify(exRate.text)}（不带 ~）`);
+ok(exRate.text === "150 tok/s ✓", `结算后精确文案 = ${JSON.stringify(exRate.text)}（带 ✓ 标记真值）`);
+ok(exRate.source === "exact", `结算态 source = ${exRate.source}`);
 ok(/sessionStats\.decodeTokens/.test(exRate.title), "精确态 title 写明口径来源");
+ok(/本步真值 300/.test(exRate.title), "精确态 title 带本步 provider 真值");
+ok(T.readRate(T.createMeterState(), 1000, false, seatMiss).source === "idle", "空态 source = idle（不拿估计冒充真值）");
 
 // ---- 5. 采样循环挂载/卸载 ----
 let intervalFn = null;
@@ -139,10 +148,12 @@ mod2.__test.PulseDock(streamingProps);
 intervalFn();
 const el3 = mod2.__test.PulseDock(streamingProps);
 ok(before === "idle", `首帧还没采到两点 → ${before}`);
-// 加权口径：ASCII 100→500 字 = 42→210 unit；est = 600 + unit × 0.80 → 633.6 → 768
-// 10 秒窗内斜率 = (768 − 633.6) / 2s = 67.2 → 67 tok/s
-ok(el3.props["data-pulse-tps"] === "67", `两拍（0s/2s，100→500 ASCII 字）→ 67.2 tok/s，实得 ${el3.props["data-pulse-tps"]}`);
-ok(el3.children[1].children[0] === "~67 tok/s", `流式 pill 带 ~ 前缀：${JSON.stringify(el3.children[1].children[0])}`);
+// 五类口径：ASCII 100→500 字全部落「字母」类，实测先验 0.24 tok/char。
+// est = 600 + 100×0.24 = 624 → 600 + 500×0.24 = 720；10 秒窗内斜率 = 96 / 2s = 48 tok/s
+ok(el3.props["data-pulse-tps"] === "48", `两拍（0s/2s，100→500 ASCII 字）→ 48 tok/s，实得 ${el3.props["data-pulse-tps"]}`);
+ok(el3.children[1].children[0] === "~48 tok/s", `流式 pill 带 ~ 前缀：${JSON.stringify(el3.children[1].children[0])}`);
+ok(el3.props["data-pulse-src"] === "estimate", `流式态探针 data-pulse-src = ${el3.props["data-pulse-src"]}`);
+ok(el3.props["data-pulse-units"] === "210", `加权 unit 探针仍按旧口径（500 × 0.42 = 210）：${el3.props["data-pulse-units"]}`);
 
 console.log("");
 console.log(fail === 0 ? "SMOKE-OK（组件层全部通过）" : `SMOKE-FAILED（${fail} 项不通过）`);
