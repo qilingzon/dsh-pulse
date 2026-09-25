@@ -155,10 +155,64 @@ No matching version found for @deepseek-ai/dsh-session@>=0.1.2 <0.2.0-0
 - 换模型实测：`.diag/dsh-pulse-upload/cdp_measure5.mjs` + `analyze5.mjs`（结果 `model2-analysis.txt`）
 - 桶名判定：`data-pulse-bucket` 探针（v0.6.0 新增，空串 = 退回全局桶）
 
+### 4.3 桌面端安装实测（2026-09-25）抓到的三个真 bug
+
+这一轮把插件真正装进**生产桌面端**（`C:\Users\qiling\.dsh`，profile `desktop`），过程里抓到三个
+真缺陷。全部已修，全部有断言或实测证据。
+
+**① 备份脚本自己坏了 —— C10/C11 的前置门不可执行**
+
+`desktop_backup.ps1` 的 UTF-8 BOM 被剥掉了（首 4 字节 `23 20 64 65`），而 2026-09-22 的 tar 修复
+往文件里加了中文注释。Windows PowerShell 5.1 对无 BOM 的非 ASCII `.ps1` 按 GBK 解码 →
+整个脚本**解析失败**（`unexpected token '}'` at line 53），退出码非零。
+
+后果不是"备份没做"，而是**"备份根本做不了"** —— 也就是「动桌面端之前必须先备份」这条铁律
+把桌面端变成了永久禁地。这比备份失败更糟：失败会被发现，不可执行会伪装成合规。
+
+修复：写回 UTF-8 **WITH BOM**，并在文件头部写清「本文件必须带 BOM，用会剥 BOM 的编辑器改过之后
+必须复查」。`Parser::ParseFile` 报错数 = 0。修复后重跑，拿到
+`BACKUP-OK bak-20260925-131825`（sha256 `C28E7284…D086A635`，method=api-digest）。
+
+**② `profile-edit.cjs` 是 ESM 源码配 `.cjs` 扩展名 —— 安装器每一次编辑都必然失败**
+
+```
+SyntaxError: Cannot use import statement outside a module
+```
+
+Node 对 `.cjs` **无条件**按 CommonJS 加载，文件里却是 `import { readFileSync } from "node:fs"`。
+于是 `install.ps1` / `install.sh` 调它做 JSON 语义增删时，**每一次都退出码 1**，
+`dsh-pulse` 静默地没被写进 `bundles` —— 装完看起来"装过了"，实际等于没装。
+
+修复：改成 `const { readFileSync, writeFileSync } = require("node:fs");`，文件名与全部调用点不动。
+新增 **verify.mjs 第 8 节**（13 条断言）把它钉死：源码不许出现 ESM `import`、必须有 `require(`，
+并且**真跑一遍 add → NOOP → remove 往返**。注意 `node --check` 在旧版也是过的 ——
+`import` 在 `.cjs` 里是**运行时**才炸的，所以断言必须真执行，不能只做语法检查。
+
+**③ patch 层停用项写成了包名，而插件声明的注册 id 不是包名**
+
+为避开「两枚重复的两位小数缓存命中」，要在 profile 的 `cordis.patch.yml` 里停用旧插件。
+第一版写成 `- id: dsh-cachehit-2dp`（包名）；读该插件自带的 `cordis.patch.yml` 才发现它声明的
+注册 id 是 **`cachehit-2dp`**：
+
+```yaml
+- insert:
+    - id: cachehit-2dp
+      name: dsh-cachehit-2dp
+```
+
+写包名 = 空转，只有一条告警，停用**不生效**。这恰好就是桌面 profile patch 里已有的那条注释
+警告所描述的模式（"行 id 按插件自带 patch 声明的注册 id 写，不写包名"）。
+修复后 `js-yaml` 解析确认拿到 `{"id":"cachehit-2dp","disabled":true}`。
+
+**安装结果（全部回读确认）**：插件在三个解析位、`client.js` sha256 三处一致；
+`profiles/desktop/package.json` 的 `bundles` 18 项含 `dsh-pulse` 且无 BOM；
+patch 层 5 项、`cachehit-2dp` 已停用；**未运行 `pnpm install`**（见 2.1）。
+
 ---
 
 ## 五、一句话总结
 
 **能降级的地方都降级了，降级后不弄坏 dock；安装器会改坏 profile 的那条路已经被 JSON 语义编辑修掉；
-编码类的坑踩了四次，现在有断言扫描全仓库。**
+编码类的坑踩了五次（最近一次是备份脚本自己的 BOM），现在有断言扫描全仓库；
+安装器的每一段都真跑过一遍往返，不再只看语法检查。**
 仍然没测的集中在「需要真人操作」与「多插件对撞」两类，见第四节最后五行。

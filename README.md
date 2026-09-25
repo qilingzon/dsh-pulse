@@ -239,7 +239,7 @@ node bench.mjs    # 性能实测：每拍开销 / 常驻内存 / 发布体积
 npm run harness:test   # verify + smoke 都跑
 ```
 
-### `verify.mjs`（实测，EXIT=0，200 条断言全 PASS）
+### `verify.mjs`（实测，EXIT=0，220 条断言全 PASS）
 
 按 `// #region` 标记把纯算术区从 `client.js` 里抽出来求值做行为断言（不是文本匹配）。节选：
 
@@ -414,7 +414,7 @@ SMOKE-OK（组件层全部通过）
 | 3.19 ns/字符 | 9750 字正文重数五类字符，5000 次平均 | v0.5.0 新增项，与正文长度成正比；`charCodeAt` 快路径 |
 | 缓冲恒 41 点 | 20 万拍后复查 `samples.length` | 与平台无关，可靠 |
 | gzip 16.7 KiB | `zlib.gzipSync(level:9)` | 可靠 |
-| 200 + 44 条断言全 PASS | `verify.mjs` / `smoke.mjs` | 断言本身可信；但 smoke 用的是**假 React** |
+| 220 + 44 条断言全 PASS | `verify.mjs` / `smoke.mjs` | 断言本身可信；但 smoke 用的是**假 React** |
 | 0.0063% 单核 | 由上三条按 2 拍/秒折算 | **只算采样算术**，不含渲染 |
 
 > 诚实备注：`bench.mjs` 初版把时间步长写成 1 ms/拍，导致环形缓冲不裁剪、测出「95.58 µs / 20001 点」的退化值。修正为真实 500 ms/拍后才是上面的数字。README 里从未出现过那组错值。

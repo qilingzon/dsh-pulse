@@ -21,7 +21,12 @@
  * 退出码：0 = 成功（含「本来就没有」）；1 = 参数 / 解析 / 写入失败。
  * 输出：一行 `OK ...` 或 `NOOP ...`，失败走 stderr + 非零退出码。
  */
-import { readFileSync, writeFileSync } from "node:fs";
+// 2026-09-25 修（真实缺陷）：本文件扩展名是 .cjs，Node 无条件按 CommonJS 加载，
+// 而这里原先写的是 ESM 的 `import { ... } from "node:fs"` →
+//   SyntaxError: Cannot use import statement outside a module
+// 即 install.ps1 / install.sh 的每一次 JSON 语义编辑都必然失败（退出码 1）。
+// 改回 CommonJS 的 require：扩展名、文件名、所有调用点都不动。
+const { readFileSync, writeFileSync } = require("node:fs");
 
 const [action, file, id, spec] = process.argv.slice(2);
 

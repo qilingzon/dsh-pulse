@@ -1,8 +1,9 @@
 // verify.mjs — dsh-pulse 自证：语法 + 抽取 formatter/window 区做行为断言 + 注册面静态核对
 // 用法：node verify.mjs     （与 cwd 无关）
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 const BASE = dirname(fileURLToPath(import.meta.url));
@@ -557,6 +558,92 @@ console.log("=== 7. 发布文件编码（BOM 会让 profile 加载器硬失败�
     const buf = readFileSync(join(BASE, f));
     const bom = buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf;
     ok(bom, `${f} 带 UTF-8 BOM（Windows PowerShell 5.1 需要；edit 工具改过会丢，必须复检）`);
+  }
+}
+
+console.log("=== 8. profile-edit.cjs 可执行性回归（v0.6.2） ===");
+{
+  // 2026-09-25 实测真缺陷：profile-edit.cjs 是 **ESM 源码 + .cjs 扩展名**。
+  // Node 对 .cjs **无条件**按 CommonJS 加载，于是：
+  //   SyntaxError: Cannot use import statement outside a module     退出码 1
+  // 后果：install.ps1 / install.sh 的每一次 JSON 语义编辑都必然失败 —— 安装器是坏的。
+  // 桌面端安装时被这条打中（bundles 没写进去，插件等于没装）。
+  // 这里钉两条：① 源码不许出现 ESM 的 import 语句；② 真跑一遍 add/remove 往返。
+  const PEDIT = join(BASE, "profile-edit.cjs");
+  let peditSrc = "";
+  try {
+    peditSrc = readFileSync(PEDIT, "utf8");
+  } catch (e) {
+    ok(false, "读不到 profile-edit.cjs：" + e.message);
+  }
+  if (peditSrc) {
+    ok(!/^\s*import\s/m.test(peditSrc),
+      "profile-edit.cjs 不含 ESM import 语句（.cjs 只能是 CommonJS；有 import 就必然加载失败）");
+    ok(/\brequire\s*\(/.test(peditSrc), "profile-edit.cjs 用 require(...) 取依赖（CommonJS 正确形态）");
+
+    // 语法自检（这一步在旧版也会过 —— import 在 .cjs 里是**运行时**才炸的，所以必须真跑）
+    try {
+      execFileSync(process.execPath, ["--check", PEDIT], { stdio: "pipe" });
+      ok(true, "node --check profile-edit.cjs");
+    } catch (e) {
+      ok(false, "node --check profile-edit.cjs → " + String(e.stderr || e.message).slice(0, 240));
+    }
+
+    // 真跑往返：add → 回读 → remove → 回读
+    const dir = mkdtempSync(join(tmpdir(), "dsh-pulse-pedit-"));
+    const pj = join(dir, "package.json");
+    const seed = { name: "t", private: true, dependencies: { a: "1" }, dsh: { profile: { bundles: ["a"] } } };
+    try {
+      // 关键：不带 BOM 写种子文件（profile 加载器对 BOM 硬失败，见第 7 节）
+      writeFileSync(pj, JSON.stringify(seed, null, 2) + "\n", "utf8");
+
+      const run = (args) => {
+        try {
+          const out = execFileSync(process.execPath, [PEDIT, ...args], { stdio: "pipe" });
+          return { code: 0, out: out.toString("utf8") };
+        } catch (e) {
+          return { code: e.status === undefined ? -1 : e.status, out: String(e.stdout || "") + String(e.stderr || "") };
+        }
+      };
+
+      const add = run(["add", pj, "dsh-pulse", "file:../../plugins/dsh-pulse"]);
+      ok(add.code === 0, `add 退出码 0（实得 ${add.code}）${add.code === 0 ? "" : " → " + add.out.trim().slice(0, 200)}`);
+      ok(/OK add dsh-pulse/.test(add.out), "add 输出 OK 行：" + add.out.trim().slice(0, 120));
+
+      let parsed = null;
+      try {
+        parsed = JSON.parse(readFileSync(pj, "utf8"));
+      } catch (e) {
+        ok(false, "add 后 package.json 仍是合法 JSON：" + e.message);
+      }
+      if (parsed) {
+        ok(Array.isArray(parsed.dsh?.profile?.bundles) && parsed.dsh.profile.bundles.includes("dsh-pulse"),
+          "add 后 bundles 含 dsh-pulse（旧版这里会整条静默丢失）");
+        ok(parsed.dependencies?.["dsh-pulse"] === "file:../../plugins/dsh-pulse", "add 后 dependencies 写入 spec");
+        ok(parsed.dsh.profile.bundles.filter((x) => x === "dsh-pulse").length === 1, "add 幂等：只出现一次");
+      }
+
+      const again = run(["add", pj, "dsh-pulse", "file:../../plugins/dsh-pulse"]);
+      ok(again.code === 0 && /NOOP/.test(again.out), "重复 add 走 NOOP 且退出码 0：" + again.out.trim().slice(0, 80));
+
+      const rm = run(["remove", pj, "dsh-pulse"]);
+      ok(rm.code === 0, `remove 退出码 0（实得 ${rm.code}）`);
+      let after = null;
+      try {
+        after = JSON.parse(readFileSync(pj, "utf8"));
+      } catch (e) {
+        ok(false, "remove 后 package.json 仍是合法 JSON：" + e.message);
+      }
+      if (after) {
+        ok(!after.dsh.profile.bundles.includes("dsh-pulse"), "remove 后 bundles 不含 dsh-pulse");
+        ok(after.dependencies?.["dsh-pulse"] === undefined, "remove 后 dependencies 不含 dsh-pulse");
+        // 旧版文本替换的经典产物：双逗号 / 空元素
+        ok(after.dsh.profile.bundles.every((x) => typeof x === "string" && x.length > 0),
+          "remove 后 bundles 无空元素（旧版文本替换会留 \"a\",, 双逗号）");
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 }
 
