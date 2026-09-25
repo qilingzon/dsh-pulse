@@ -157,6 +157,10 @@ No matching version found for @deepseek-ai/dsh-session@>=0.1.2 <0.2.0-0
 
 - 换模型实测：`.diag/dsh-pulse-upload/cdp_measure5.mjs` + `analyze5.mjs`（结果 `model2-analysis.txt`）
 - 桶名判定：`data-pulse-bucket` 探针（v0.6.0 新增，空串 = 退回全局桶）
+- **设置页曲线真机核验**（v0.7.0）：`.diag/dsh-pulse-upload/cdp_verify_curve2.mjs`
+  （结果 `curve-verify2.json`）。要点：设置对话框是「左导航 + 右内容区」，**必须先点开
+  左侧那一项**再查探针 —— 直接查会得到假阴性。另外 `cdp_settings_tree.mjs` 用来摊开
+  dialog 结构，`cdp_loader_trace.mjs` 用来确认插件是否被 `create`。
 
 ### 4.3 桌面端安装实测（2026-09-25）抓到的三个真 bug
 
@@ -243,8 +247,33 @@ patch 层 5 项、`cachehit-2dp` 已停用；**未运行 `pnpm install`**（见 
 这是 v0.7.0 引入的全部显著开销。CPU 增量：每拍 +4.3 µs（占流式一拍 13.6%），
 设置页重画 340 µs/帧 × 2 帧/秒且**仅在设置页打开时发生**。
 
-**还没测的**：设置页分区的**真机挂载**（需要在生产渲染器里打开设置对话框看）。
-这属于「需要真人操作」那一类，已列进本节的待测清单。
+**真机挂载：已测（2026-09-25，lab `gen4-lab` 真浏览器 + CDP）**
+
+第一次探针写错了，报了个假阴性 —— 记录在此，因为它是个容易复发的坑：
+
+> 设置对话框是「**左侧分区导航 + 右侧内容区**」，一次只渲染**当前选中**的分区。
+> 我直接查 `[data-pulse-curve]` 时选中的是内置「通用」，所以查不到。
+> 我据此以为注册失败，插桩打了三条日志才看清：`apply()` 到了、`inject` 回调 fired、
+> `register` 返回了函数、`label()` 返回 `"输出速度曲线"` —— **注册一直是成功的**，
+> 证据就在左侧 nav 里：`[…, "Agent 预设", "输出速度曲线"]`。
+> 教训：探针必须打到**该功能真正出现的那个容器**里，否则「查不到」会被误读成「没生效」。
+
+点开 nav 里那一项之后的实测（`cdp_verify_curve2.mjs`，14 条判定全 TRUE，干净版 client.js 复跑一次同样全 TRUE）：
+
+| 观测 | 值 |
+|---|---|
+| nav 项 | `输出速度曲线`（排在「Agent 预设」之后） |
+| `data-pulse-curve` | `240`（与播种的 240 点一致） |
+| `data-pulse-curve-peak` / `-avg` | `83` / `60` |
+| `data-pulse-curve-cache` | `46.96` |
+| `data-pulse-curve-src` | `settings` |
+| SVG path | 3 条：exact 实线 `#4c8dff`(1.6) / est 虚线 `#4c8dff`(1.6) / 缓存 `#f0a020`(1.4) |
+| 网格 / 刻度文本 | 5 条横线 / 15 个刻度文本 |
+| 实际渲染尺寸 | 564 × 334 px |
+| 跨重启留存 | reload 后 localStorage 轨迹仍是 240 点（走的就是 `dsh-pulse:trace:v1` 读回路径） |
+
+即：**结构性风险这一条已被真机证伪 —— 设置页分区挂得上、画得出、数据跨 reload 留存。**
+（仍未测的是**生产桌面端**里目视，属于「需要真人操作」。）
 
 ---
 
