@@ -50,6 +50,15 @@ try {
 if (json === null || typeof json !== "object" || Array.isArray(json)) die(`${file} 顶层不是对象`);
 
 const before = JSON.stringify(json);
+// 记下改动前的状态：NOOP 其实分两种 —— 「本来就没有」和「已经是目标状态」。
+// 旧版把两者都写成「本来就不在」，幂等重装时会给出与事实相反的提示（2026-09-25 实测撞到：
+// 插件明明已装好，输出却说「本来就不在」）。
+const hadDep = json.dependencies !== null && typeof json.dependencies === "object" && !Array.isArray(json.dependencies)
+  ? Object.prototype.hasOwnProperty.call(json.dependencies, id)
+  : false;
+const hadBundle = Array.isArray(json.dsh && json.dsh.profile && json.dsh.profile.bundles)
+  ? json.dsh.profile.bundles.includes(id)
+  : false;
 
 if (action === "add") {
   if (!spec) die("add 需要 <spec>（例如 file:../../plugins/dsh-pulse）");
@@ -80,7 +89,12 @@ if (action === "add") {
 
 const after = JSON.stringify(json);
 if (after === before) {
-  process.stdout.write(`NOOP ${id} 本来就不在 ${file}\n`);
+  const alreadyThere = hadDep || hadBundle;
+  process.stdout.write(
+    alreadyThere
+      ? `NOOP ${id} 已是目标状态（依赖=${hadDep ? "有" : "无"}，bundles=${hadBundle ? "有" : "无"}），无需改动\n`
+      : `NOOP ${id} 本来就不在 ${file}\n`
+  );
   process.exit(0);
 }
 

@@ -625,6 +625,13 @@ console.log("=== 8. profile-edit.cjs 可执行性回归（v0.6.2） ===");
 
       const again = run(["add", pj, "dsh-pulse", "file:../../plugins/dsh-pulse"]);
       ok(again.code === 0 && /NOOP/.test(again.out), "重复 add 走 NOOP 且退出码 0：" + again.out.trim().slice(0, 80));
+      // 2026-09-25 实测撞到：插件明明已装好，NOOP 却输出「本来就不在」—— 与事实相反。
+      // NOOP 必须区分「已是目标状态」与「本来就不在」两种情形。
+      ok(/已是目标状态/.test(again.out),
+        "幂等 NOOP 说「已是目标状态」（旧版一律说「本来就不在」，与事实相反）：" + again.out.trim().slice(0, 90));
+      const rmAbsent = run(["remove", pj, "no-such-plugin"]);
+      ok(rmAbsent.code === 0 && /本来就不在/.test(rmAbsent.out),
+        "移除一个不存在的 id → NOOP「本来就不在」：" + rmAbsent.out.trim().slice(0, 80));
 
       const rm = run(["remove", pj, "dsh-pulse"]);
       ok(rm.code === 0, `remove 退出码 0（实得 ${rm.code}）`);

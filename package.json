@@ -1,6 +1,6 @@
 {
   "name": "dsh-pulse",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "客户端插件：用 slot 阴影顶替内置统计行，把「缓存命中」显示为两位小数（页面上只留一枚读数）；另加一枚只读的 10 秒滑窗平均输出速度（tok/s），区分流中估计与结算后 provider 真值两态。",
   "type": "module",
   "main": "index.js",
@@ -55,7 +55,7 @@
   "dsh": {
     "id": "dsh-pulse",
     "name": "缓存命中两位小数（顶替内置）+ 精确输出速度",
-    "version": "0.7.0",
+    "version": "0.7.1",
     "repo": "github/qilingzon/dsh-pulse",
     "permissions": "客户端 slot 注册（只读 useProjection，无宿主侧改动）",
     "client": {
