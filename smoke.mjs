@@ -194,6 +194,72 @@ ok(el3.children[1].children[0] === "~48 tok/s", `流式 pill 带 ~ 前缀：${JS
 ok(el3.props["data-pulse-src"] === "estimate", `流式态探针 data-pulse-src = ${el3.props["data-pulse-src"]}`);
 ok(el3.props["data-pulse-units"] === "210", `加权 unit 探针仍按旧口径（500 × 0.42 = 210）：${el3.props["data-pulse-units"]}`);
 
+// ---- 5. v0.7.0 设置页曲线组件：真渲染一遍，断言 SVG 与探针 ----
+{
+  const TC = mod.__test;
+  ok(typeof TC.PulseCurveSection === "function", "__test.PulseCurveSection 可用");
+  ok(TC.sharedTrace && Array.isArray(TC.sharedTrace.points),
+    "__test.sharedTrace 可用（dock 与设置页共享的模块级轨迹）");
+
+  // 先让模块单例完成一次性装载 —— 否则组件首帧渲染时 ensureTrace() 会把 points
+  // 换成一个新数组，我们刚推进去的数据就丢了（这个坑第一次就踩到了）。
+  TC.ensureTrace();
+  ok(TC.sharedTrace.ready === true, "ensureTrace() 完成一次性装载（ready = true）");
+
+  // 造 20 个点：前 10 个是流式（只有 est），后 10 个是结算（只有 exact），缓存线全程有值。
+  const tNow = Date.now();
+  const pts = [];
+  for (let i = 0; i < 20; i += 1) {
+    const streaming = i < 10;
+    pts.push(TC.tracePoint(tNow - (20 - i) * 500, streaming ? 30 + i : null, streaming ? null : 80 + i, 40 + i));
+  }
+  TC.sharedTrace.points.length = 0;
+  for (const p of pts) TC.sharedTrace.points.push(p);
+
+  const curveEl = TC.PulseCurveSection({ t: seatMiss });
+  ok(curveEl && curveEl.type === "div", "曲线分区渲染出根 div");
+  ok(curveEl.props["data-pulse-curve"] === "20",
+    `探针 data-pulse-curve = 点数 20，实得 ${curveEl.props["data-pulse-curve"]}`);
+  ok(curveEl.props["data-pulse-curve-src"] === "settings",
+    `探针 data-pulse-curve-src = settings，实得 ${curveEl.props["data-pulse-curve-src"]}`);
+  ok(curveEl.props["data-pulse-curve-peak"] === "99",
+    `峰值探针 = 99 tok/s（后 10 点 exact 80+i，i=10..19 → 90..99），实得 ${curveEl.props["data-pulse-curve-peak"]}`);
+  ok(curveEl.props["data-pulse-curve-cache"] === "59",
+    `末点缓存命中 = 40+19 = 59%，实得 ${curveEl.props["data-pulse-curve-cache"]}`);
+
+  const svg = curveEl.children.find((c) => c && c.type === "svg");
+  ok(!!svg, "渲染出 SVG");
+  ok(svg && svg.props["data-pulse-curve-svg"] === "1", "SVG 带 data-pulse-curve-svg 探针");
+  ok(svg && svg.props.viewBox === "0 0 760 210", `SVG viewBox = ${svg && svg.props.viewBox}`);
+
+  const paths = svg ? svg.children.filter((c) => c && c.type === "path") : [];
+  ok(paths.length === 3, `三条线：exact 实线 + est 虚线 + 缓存线，实得 ${paths.length}`);
+  const dashed = paths.filter((p) => p.props.strokeDasharray);
+  ok(dashed.length === 1, `只有 est 那条是虚线，实得 ${dashed.length} 条虚线`);
+  ok(dashed.length === 1 && typeof dashed[0].props.d === "string" && dashed[0].props.d.length > 0,
+    `虚线 path 的 d 串非空（实得 ${dashed.length === 1 ? JSON.stringify(dashed[0].props.d) : "无虚线"}）`);
+  ok(paths.every((p) => p.props.d && p.props.d.indexOf("M") === 0),
+    "每条 path 的 d 串都以 M 开头（不是空路径）");
+  ok(paths.every((p) => p.props.fill === "none"), "曲线不填充（折线图，不是面积图）");
+
+  const gridGroup = svg ? svg.children.find((c) => c && c.type === "g") : null;
+  const gridLines = gridGroup ? gridGroup.children.filter((c) => c && c.type === "line") : [];
+  ok(gridLines.length === 5, `横向网格 5 条，实得 ${gridLines.length}`);
+  const gridTexts = gridGroup ? gridGroup.children.filter((c) => c && c.type === "text") : [];
+  ok(gridTexts.length === 15, `左轴 tok/s 5 个 + 右轴命中% 5 个 + X 轴 5 个 = 15 个刻度文本，实得 ${gridTexts.length}`);
+
+  // 无数据时：探针归零 + 出提示，而不是画一张空图装样子。
+  TC.sharedTrace.points.length = 0;
+  const emptyEl = TC.PulseCurveSection({ t: seatMiss });
+  ok(emptyEl.props["data-pulse-curve"] === "0", `清空后点数探针 = 0，实得 ${emptyEl.props["data-pulse-curve"]}`);
+  ok(emptyEl.props["data-pulse-curve-cache"] === "na", "无缓存数据时探针 = na（不假装 0%）");
+  const emptySvg = emptyEl.children.find((c) => c && c.type === "svg");
+  const emptyPaths = emptySvg ? emptySvg.children.filter((c) => c && c.type === "path") : [];
+  ok(emptyPaths.length === 0, `无数据时不画任何 path，实得 ${emptyPaths.length}`);
+  const hint = emptyEl.children.filter((c) => c && c.type === "div" && typeof c.children[0] === "string" && c.children[0].indexOf("暂无数据") === 0);
+  ok(hint.length === 1, "无数据时给出「暂无数据」提示（并说明曲线从何而来）");
+}
+
 console.log("");
 console.log(fail === 0 ? "SMOKE-OK（组件层全部通过）" : `SMOKE-FAILED（${fail} 项不通过）`);
 process.exit(fail === 0 ? 0 : 1);

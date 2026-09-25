@@ -647,6 +647,222 @@ console.log("=== 8. profile-edit.cjs 可执行性回归（v0.6.2） ===");
   }
 }
 
+console.log("=== 9. v0.7.0 设置页曲线（抽取 trace + curve 区做行为断言） ===");
+{
+  const ws = src.indexOf("// #region window");
+  const we = src.indexOf("// #endregion", ws);
+  const ts = src.indexOf("// #region trace");
+  const te = src.indexOf("// #endregion", ts);
+  const cs = src.indexOf("// #region curve");
+  const ce = src.indexOf("// #endregion", cs);
+  if (ws < 0 || we < 0 || ts < 0 || te < 0 || cs < 0 || ce < 0) {
+    ok(false, "找不到 window / trace / curve 标记块之一");
+  } else {
+    // trace 区用到 window 区的 windowSlope / safeStorage / nonNeg，所以三段一起求值。
+    const c = new Function(
+      src.slice(ws, we) + "\n" + src.slice(ts, te) + "\n" + src.slice(cs, ce) +
+        "\nreturn { tracePoint, tracePush, traceLoad, traceSave, ensureTrace, cachePercentOf, traceRecord," +
+        " curveClip, curveSeries, curveSpeed, curveFilter, niceCeil, curvePath, curveStats, curveTicks," +
+        " pushSample, createMeterState," +
+        " TRACE_KEY, TRACE_CAP, TRACE_SAVE_MS, CURVE_WINDOW_MS, CURVE_GAP_MS, RATE_SPAN_MS };"
+    )();
+    const {
+      tracePoint, tracePush, traceLoad, traceSave, ensureTrace, cachePercentOf, traceRecord,
+      curveClip, curveSeries, curveSpeed, curveFilter, niceCeil, curvePath, curveStats, curveTicks,
+      pushSample, createMeterState,
+      TRACE_KEY, TRACE_CAP, TRACE_SAVE_MS, CURVE_WINDOW_MS, CURVE_GAP_MS
+    } = c;
+
+    // --- 9.1 常量契约 ---
+    ok(TRACE_KEY === "dsh-pulse:trace:v1", `轨迹键挂在 dsh-pulse 命名空间下：${TRACE_KEY}`);
+    ok(TRACE_CAP === 1200, `容量 1200 点 = 600s = 10 分钟（每点 500ms）：${TRACE_CAP}`);
+    ok(CURVE_WINDOW_MS === 600000, `图上窗口 10 分钟：${CURVE_WINDOW_MS}`);
+    ok(TRACE_SAVE_MS === 5000, `落盘节流 5s（不跟着 500ms 采样写盘）：${TRACE_SAVE_MS}`);
+    ok(TRACE_SAVE_MS > 500, "落盘间隔必须远大于采样间隔（否则每拍同步写盘会拖帧）");
+    ok(CURVE_WINDOW_MS === TRACE_CAP * 500, "窗口长度与容量自洽：1200 × 500ms = 600000ms");
+
+    // --- 9.2 tracePoint：速率不是累计值；非正值一律 null（空闲不画成 0） ---
+    const p0 = tracePoint(1000, 42.567, null, 87.4321);
+    ok(p0.t === 1000 && p0.est === 42.6 && p0.exact === null && p0.cache === 87.43,
+      `tracePoint 取整：est 42.6 / exact null / cache 87.43，实得 ${JSON.stringify(p0)}`);
+    ok(tracePoint(1, 0, 0, 0).est === null, "速率为 0 → null（空闲不画成 0）");
+    ok(tracePoint(1, -5, -5, -5).est === null && tracePoint(1, -5, -5, -5).cache === null, "负值 → null");
+    ok(tracePoint(1, NaN, Infinity, NaN).est === null && tracePoint(1, NaN, Infinity, NaN).cache === null,
+      "NaN / Infinity → null（不把坏数字写进轨迹）");
+    ok(tracePoint(1, undefined, undefined, undefined).est === null, "undefined → null");
+    ok(tracePoint(1, 10, 10, 100).cache === 100, "cache 100 是合法值（全命中），不能被当成假值丢掉");
+
+    // --- 9.3 tracePush：环形裁剪 ---
+    const ring = [];
+    for (let i = 0; i < 5; i += 1) tracePush(ring, tracePoint(i, i + 1, null, null), 3);
+    ok(ring.length === 3, `容量 3 时只留 3 点，实得 ${ring.length}`);
+    ok(ring[0].t === 2 && ring[2].t === 4, `丢的是最老的点：剩 t=2,3,4，实得 ${ring.map((p) => p.t).join(",")}`);
+
+    // --- 9.4 持久化：往返 / 版本不符 / 损坏 / 无 storage ---
+    const fakeStorage = (initial) => {
+      const map = new Map(initial ? [[TRACE_KEY, initial]] : []);
+      return {
+        getItem: (k) => (map.has(k) ? map.get(k) : null),
+        setItem: (k, v) => { map.set(k, v); },
+        _raw: () => map.get(TRACE_KEY)
+      };
+    };
+    const st1 = fakeStorage();
+    ok(traceSave(st1, [tracePoint(10, 5, null, 50)]) === true, "traceSave 写入成功");
+    const back = traceLoad(st1);
+    ok(back.length === 1 && back[0].t === 10 && back[0].est === 5 && back[0].cache === 50,
+      `写入 → 读回一致：${JSON.stringify(back)}`);
+    ok(traceLoad(fakeStorage("不是 JSON")).length === 0, "JSON 损坏 → 空数组（不抛）");
+    ok(traceLoad(fakeStorage(JSON.stringify({ v: 999, points: [] }))).length === 0, "版本不符 → 空数组");
+    ok(traceLoad(fakeStorage(JSON.stringify({ v: 1, points: "不是数组" }))).length === 0, "points 不是数组 → 空数组");
+    ok(traceLoad(null).length === 0, "无 storage（隐私模式）→ 空数组，不抛");
+    ok(traceSave(null, []) === false, "无 storage 时 save 返回 false，不抛");
+    const bad = traceLoad(fakeStorage(JSON.stringify({
+      v: 1, points: [{ t: 1, est: 5 }, { t: "x", est: 5 }, { nope: 1 }, { t: 3, est: -1, cache: 20 }]
+    })));
+    ok(bad.length === 2, `丢掉坏点（非数字 t / 无 t）：只剩 2 点，实得 ${bad.length}`);
+    ok(bad[1].est === null && bad[1].cache === 20, "坏字段被 tracePoint 归一化（est 负 → null，cache 保留）");
+    const unsorted = traceLoad(fakeStorage(JSON.stringify({
+      v: 1, points: [{ t: 300, est: 1 }, { t: 100, est: 1 }, { t: 200, est: 1 }]
+    })));
+    ok(unsorted.map((p) => p.t).join(",") === "100,200,300", `读回后按 t 排序：${unsorted.map((p) => p.t).join(",")}`);
+    const oversized = [];
+    for (let i = 0; i < TRACE_CAP + 50; i += 1) oversized.push({ t: i, est: 1 });
+    ok(traceLoad(fakeStorage(JSON.stringify({ v: 1, points: oversized }))).length === TRACE_CAP,
+      `读回时也裁到容量上限 ${TRACE_CAP}`);
+
+    // --- 9.5 ensureTrace：只读一次盘（幂等） ---
+    const counting = { n: 0, getItem: () => { counting.n += 1; return null; }, setItem: () => {} };
+    const storeA = ensureTrace(counting);
+    const storeB = ensureTrace(counting);
+    ok(storeA === storeB, "ensureTrace 两次返回同一个模块单例（dock 与设置页共享同一份）");
+    ok(counting.n === 1, `只读一次盘，实得 ${counting.n} 次`);
+
+    // --- 9.6 cachePercentOf：与 computeView 同分母（缓存读取 + 未缓存输入） ---
+    ok(Math.round(cachePercentOf({ cacheReadTokens: 8750, uncachedInputTokens: 1250 }) * 100) / 100 === 87.5,
+      "8750 / (8750+1250) = 87.5%");
+    ok(cachePercentOf({ cacheReadTokens: 0, uncachedInputTokens: 0 }) === null, "无计费输入 → null");
+    ok(cachePercentOf({ cacheReadTokens: 10 }) === 100, "只有缓存读取 → 100%");
+    ok(cachePercentOf(null) === null && cachePercentOf(undefined) === null, "无投影 → null");
+    ok(cachePercentOf({ cacheReadTokens: -5, uncachedInputTokens: -5 }) === null, "负数被 nonNeg 归零后无分母 → null");
+
+    // --- 9.7 traceRecord：流式取 est / 结算取 exact / 空闲留空 / 节流落盘 ---
+    const meter = createMeterState();
+    const samples = [];
+    // 流式：est 累计值在涨 → est 速率 > 0
+    pushSample(samples, 1000, null, 0, 20000);
+    pushSample(samples, 1500, null, 100, 20000);
+    pushSample(samples, 2000, null, 300, 20000);
+    const recStore = { points: [], lastSave: 0, ready: true };
+    const live = traceRecord(recStore, 2000, samples, true, 61.5, null);
+    ok(live.est !== null && live.exact === null, `流式点只写 est（实得 est=${live.est}, exact=${live.exact}）`);
+    ok(Math.abs(live.est - 300) < 1,
+      `est 速率 = 窗内 (300-0) tok ÷ 1.0s（2s 子窗，锚点落在 t=1000）= 300 tok/s，实得 ${live.est}`);
+    ok(live.cache === 61.5, "同拍记录缓存命中率");
+
+    // 结算：exact 累计值在涨 → exact 速率 > 0
+    const s2 = [];
+    pushSample(s2, 3000, 0, null, 20000);
+    pushSample(s2, 4000, 400, null, 20000);
+    const settled = traceRecord(recStore, 4000, s2, false, 61.5, null);
+    ok(settled.est === null && settled.exact !== null,
+      `结算点只写 exact（实得 est=${settled.est}, exact=${settled.exact}）`);
+    ok(Math.abs(settled.exact - 400) < 1, `exact 速率 = 400/1.0s = 400 tok/s，实得 ${settled.exact}`);
+
+    // 空闲：计数器不动 → 斜率为 0 → 两个字段都 null（图上断开，而不是贴着 0 画）
+    const s3 = [];
+    pushSample(s3, 5000, 400, null, 20000);
+    pushSample(s3, 6000, 400, null, 20000);
+    const idle = traceRecord(recStore, 6000, s3, false, null, null);
+    ok(idle.est === null && idle.exact === null, "空闲点两个速率都是 null（不画成 0）");
+
+    // 节流：5s 内不重复落盘
+    const saveStore = { points: [], lastSave: 0, ready: true };
+    const spyStorage = fakeStorage();
+    let writes = 0;
+    const counted = {
+      getItem: spyStorage.getItem,
+      setItem: (k, v) => { writes += 1; spyStorage.setItem(k, v); }
+    };
+    traceRecord(saveStore, 10000, s2, false, null, counted);
+    ok(writes === 1, `首次记录就落盘一次，实得 ${writes}`);
+    traceRecord(saveStore, 10499, s2, false, null, counted);
+    ok(writes === 1, `4999ms 后不重复落盘（节流生效），实得 ${writes}`);
+    traceRecord(saveStore, 15000, s2, false, null, counted);
+    ok(writes === 2, `满 5000ms 后落盘，实得 ${writes}`);
+
+    // --- 9.8 curveClip / curveSeries / curveSpeed / curveFilter ---
+    const now = 100000;
+    const pts = [
+      tracePoint(now - 900000, 10, null, 30),  // 窗外
+      tracePoint(now - 300000, 20, null, 40),
+      tracePoint(now - 299500, null, 50, 45),
+      tracePoint(now - 1000, 30, null, null)
+    ];
+    const clipped = curveClip(pts, now, CURVE_WINDOW_MS);
+    ok(clipped.length === 3, `裁掉 10 分钟窗外的点：剩 3，实得 ${clipped.length}`);
+    ok(curveClip(pts, now, CURVE_WINDOW_MS).every((p) => p.t >= now - CURVE_WINDOW_MS), "窗内点都在 [now-10min, now]");
+
+    const speed = curveSpeed(clipped);
+    ok(speed.length === 3, `速度序列丢掉全空的点：剩 3，实得 ${speed.length}`);
+    ok(speed[1].src === "exact" && speed[1].v === 50, "结算点优先取 exact 并标记 src=exact");
+    ok(speed[0].src === "estimate" && speed[0].v === 20, "流式点取 est 并标记 src=estimate");
+    ok(curveFilter(speed, "exact").length === 1 && curveFilter(speed, "estimate").length === 2,
+      "按 src 过滤出两条线：exact 1 点 / estimate 2 点");
+
+    const caches = curveSeries(clipped, "cache");
+    ok(caches.length === 2 && caches[0].v === 40 && caches[1].v === 45,
+      `缓存序列跳过 null：${JSON.stringify(caches.map((p) => p.v))}`);
+    ok(curveSeries([], "cache").length === 0, "空轨迹 → 空序列");
+
+    // --- 9.9 niceCeil：轴上限必须是好看的整数，且不小于峰值 ---
+    const niceCases = [[0, 1], [-3, 1], [0.4, 0.5], [1, 1], [1.5, 2], [7, 10], [10, 10], [12, 20], [45, 50], [120, 200], [1000, 1000], [1500, 2000]];
+    for (const [input, want] of niceCases) {
+      const got = niceCeil(input);
+      ok(got === want && got >= input, `niceCeil(${input}) = ${got}（期望 ${want}，且 ≥ 输入）`);
+    }
+
+    // --- 9.10 curvePath：坐标映射 / 断开 / 夹紧 ---
+    ok(curvePath([], 0, 1000, 100, 50, 10) === "", "空序列 → 空 path（不画垃圾）");
+    ok(curvePath([{ t: 0, v: 5 }], 0, 1000, 100, 50, 10) !== "", "单点也画（一个 M）");
+    const one = curvePath([{ t: 0, v: 5 }], 0, 1000, 100, 50, 10);
+    ok(one.startsWith("M") && one.indexOf("L") < 0, `单点只有 M 没有 L：${one}`);
+    const line = curvePath([{ t: 0, v: 0 }, { t: 1000, v: 10 }], 0, 1000, 100, 50, 10);
+    ok(line === "M0 50 L100 0", `满量程两点：左下 → 右上（y 轴反向），实得 "${line}"`);
+    const clamped = curvePath([{ t: 0, v: 99 }, { t: 1000, v: 99 }], 0, 1000, 100, 50, 10);
+    ok(clamped === "M0 0 L100 0", `超上限的值被夹到 vMax（y 恒为 0，不出现负 y）：${clamped}`);
+    const gapped = curvePath([{ t: 0, v: 5 }, { t: 1000, v: 5 }, { t: 9000, v: 5 }], 0, 10000, 100, 50, 10, 2500);
+    ok((gapped.match(/M/g) || []).length === 2, `间隔超 2500ms 断成两段（两个 M）：${gapped}`);
+    const contiguous = curvePath([{ t: 0, v: 5 }, { t: 500, v: 5 }, { t: 1000, v: 5 }], 0, 1000, 100, 50, 10, 2500);
+    ok((contiguous.match(/M/g) || []).length === 1, `500ms 间隔不断开（只有一个 M）：${contiguous}`);
+    ok(curvePath([{ t: 0, v: 1 }], 0, 0, 100, 50, 10) === "", "时间跨度 0 → 空 path（不除零）");
+    ok(curvePath([{ t: 0, v: 1 }], 0, 1000, 0, 50, 10) === "", "宽度 0 → 空 path");
+    ok(curvePath([{ t: 0, v: 1 }], 0, 1000, 100, 50, 0) === "", "vMax 0 → 空 path（不除零）");
+
+    // --- 9.11 curveStats / curveTicks ---
+    ok(JSON.stringify(curveStats([])) === JSON.stringify({ count: 0, peak: 0, avg: 0 }), "空序列统计全 0");
+    const st = curveStats([{ t: 0, v: 10 }, { t: 1, v: 30 }, { t: 2, v: 20 }]);
+    ok(st.count === 3 && st.peak === 30 && st.avg === 20, `统计：count 3 / peak 30 / avg 20，实得 ${JSON.stringify(st)}`);
+    const tk = curveTicks(CURVE_WINDOW_MS, 5);
+    ok(tk.length === 5 && tk[0] === -10 && tk[4] === 0, `10 分钟 5 刻度 = [-10 ... 0]，实得 ${JSON.stringify(tk)}`);
+    ok(curveTicks(CURVE_WINDOW_MS, 1).length === 5, "刻度数 < 2 时退回默认 5（不除零）");
+
+    // --- 9.12 注册面静态核对（设置页分区） ---
+    ok(src.indexOf('"settings.section"') >= 0, '在 settings.section 上注册（设置页分区）');
+    ok(/name: "settings\.section",\s*\n\s*id: "dsh-pulse",/.test(src), "分区 id = dsh-pulse");
+    ok(/order: CURVE_SECTION_ORDER/.test(src) && /CURVE_SECTION_ORDER = 160/.test(src),
+      "order = 160（已装插件占用 85/110/120/130/150/151/152，排最后不挤别人）");
+    ok(src.indexOf('"data-pulse-curve"') >= 0, "带 data-pulse-curve 探针（CDP 可判定曲线是否画出来）");
+    ok(src.indexOf('"data-pulse-curve-peak"') >= 0 && src.indexOf('"data-pulse-curve-avg"') >= 0,
+      "带 peak / avg 探针");
+    ok(/try \{\s*return ctx\.slots\.register\(\s*\{\s*name: "settings\.section"/.test(src),
+      "settings.section 注册被 try/catch 包住 → 拿不到 slots API 或注册抛错时静默降级");
+    ok(src.indexOf("traceRecord(ensureTrace(), now, state.samples, streaming, cachePercentOf(state.usage))") >= 0,
+      "dock 的采样器同拍写入共享轨迹（不额外开定时器、不额外扫文本）");
+    ok(/locale: NS/.test(src), "分区声明 locale → 组件拿到 t（拿不到时 tr() 退回字面量）");
+  }
+}
+
 console.log("");
 console.log(fail === 0 ? "VERIFY-OK（全部断言通过）" : `VERIFY-FAILED（${fail} 项不通过）`);
 process.exit(fail === 0 ? 0 : 1);

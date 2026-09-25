@@ -2,20 +2,20 @@
 
 > 目的：任何人（包括未来的我）都能一眼看出「测过什么、怎么测的、没测什么」。
 > 更新规则：每轮测试后改这张表；第三档（未测）里的条目转档时，把证据链写进来。
-> 当前版本：**v0.5.0** ｜ 最后更新：2026-09-22
+> 当前版本：**v0.7.0** ｜ 最后更新：2026-09-25
 
 ## 一览
 
 | 层 | 手段 | 状态 |
 |---|---|---|
-| L1 纯函数 | `node verify.mjs`（**200 条断言**） | ✅ 全绿 |
-| L2 组件渲染 | `node smoke.mjs`（**44 条断言**，真装载 client.js + 假 React） | ✅ 全绿 |
+| L1 纯函数 | `node verify.mjs`（**303 条断言**） | ✅ 全绿 |
+| L2 组件渲染 | `node smoke.mjs`（**66 条断言**，真装载 client.js + 假 React） | ✅ 全绿 |
 | L3 安装器 | 假 DSH home 上实测 install / 幂等重跑 / remove；`install.ps1` 过 PS 5.1 解析 | ✅ 通过 |
 | L4 真实浏览器 | gen4-lab 实机，**三轮不同文体**（含一轮多步 + 工具调用），产品 `decodeTokens` 为权威值 | ✅ 关键路径通过 |
 | L5 性能 | `node bench.mjs`（每拍 / 字符重数 / 缓冲 / 体积） | ✅ 数字可复算 |
 | L6 文档一致性 | README / HARNESS_PLUGIN / 本文件 的数字 ↔ bench & 实测输出 | ✅ 本轮同步过 |
 
-## L1 · 纯函数（verify.mjs，154 条）
+## L1 · 纯函数（verify.mjs，303 条）
 
 覆盖：
 
@@ -37,7 +37,7 @@
 - **`readRate` 三态**：`estimate` / `exact` / `idle` 的文案、前缀、tooltip 口径来源。
 - **注册面静态核对**：dock 目标、id、order、6 个只读探针、定时器清理、不碰 DOM、不走 RPC、**不发网络请求**。
 
-## L2 · 组件渲染（smoke.mjs，33 条）
+## L2 · 组件渲染（smoke.mjs，66 条）
 
 真装载 `client.js`（走 `window.__ModuleLoader__.load`），假 React 替身（含跨渲染持久化的 `useRef`），
 断言：两枚 pill 文案、`data-pulse-*` 探针初始值、`~` 前缀与 `✓` 后缀、`data-pulse-src` 三态、
@@ -115,7 +115,9 @@ tooltip 口径来源与五类标定摊开、null 不占位、定时器挂载/卸
 | **后台标签节流**（约 1 次/分钟） | 通用浏览器行为，未在本机验证 |
 | **`pnpm install` 收口步** | lab 从三处解析位副本直接加载成功，该步被跳过 |
 | **对真实 gen4_home 的 `--remove`** | 只在假 home 执行过 |
-| **生产 `C:\Users\qiling\.dsh`** | 按 C10/C11 全程未触碰 |
+| **设置页分区的真机挂载** | v0.7.0 新增：`settings.section` 在真浏览器里**挂得上、画得出**只在组件层（假 React）验过；真机需人工打开设置对话框目视 |
+| **`localStorage` 轨迹的长期增长** | v0.7.0 新增：1200 点环形 + 每 5s 快照，单次快照实测 58.6 KiB；多日运行下的键体积未做长观察 |
+| **生产 `C:\Users\qiling\.dsh`** | 按 C10/C11：动之前必须 `desktop_backup.ps1` → BACKUP-OK；v0.6.2 起已按此流程安装过 |
 | **非 web 客户端** | `client.platform: web`，其余平台不适用 |
 | **React 真实调度 / 卸载竞态** | 假 React 替身覆盖不到 |
 | **精确的流中 token 数** | **物理不可得**，不是「未测」：provider 只在 finish chunk 上报 usage，harness 也没有分词器（源码证据见 README《七》第一档）。任何插件都做不到 |

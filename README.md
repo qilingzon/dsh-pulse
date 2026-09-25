@@ -19,6 +19,8 @@
 ```
 缓存命中 99.87%   ~42.7 tok/s     ← 流式进行中：估计值，虚线边
 缓存命中 99.87%   41.8 tok/s ✓    ← 步骤结算后：provider 真值，实线边
+
+设置页「输出速度曲线」       ← 最近 10 分钟的双曲线：速度（左轴）+ 缓存命中（右轴），跨重启留存
 ```
 
 **左边那枚不是新增的** —— 它是被本插件**顶替**的内置统计行（未安装时它显示 `99%`）。
@@ -81,6 +83,51 @@
 字符分类走 `charCodeAt` 比较而不是正则 —— 采样每 500 ms 要把在飞正文重数一遍，四轮正则每字符的代价是可测的（实测 `0.41 µs/拍` vs `0.24 µs/拍`）。
 
 > **为什么必须有估算线**：宿主在流式进行中**根本不知道 token 数**。`sessionStats.decodeTokens` 只在 `assistant/message` 事件落盘时 +usage（见 `sessionStatsProjectionDefinition.apply` 的 `case "assistant/message"`）；流式阶段走的是客户端独有的 transient `assistant/live-chunk`，**只带文本块和时间戳，不带 usage**。provider 侧同样如此：DeepSeek 适配器发 `stream_options: { include_usage: true }`，源码注释写明 usage 来自 *"the finish chunk or the trailing usage-only chunk"*。所以「流式进行中显示一个精确 tok/s」在这个宿主上**物理不可能** —— 唯一可用的活信号就是文本增长速度。本插件把它标成 `~` 而不是假装精确。
+
+---
+
+### 3. 设置页实时曲线 · v0.7.0「看得见的曲线」
+
+在 DSH **设置页**新增一个分区「输出速度曲线」（`settings.section`，`order: 160`）：
+
+- **左轴**：输出速度 `tok/s`。流式段画**虚线**（估计），结算段画**实线**（provider 真值），空闲**断开**不画 —— 空闲不是「0 tok/s」，是「没有」。
+- **右轴**：缓存命中率 `%`（橙色），与 dock 那枚读数同源（`tokenUsage` 投影）。
+- **窗口 10 分钟**，500 ms 一点，容量 1200 点。
+- 带**峰值 / 均值 / 采样点数 / 当前命中率**，以及 5 条网格与双轴刻度。
+
+#### 3.1 为什么必须加一层「模块级共享轨迹」
+
+设置页是个 **dialog**，而 `settings.section` 这个槽**不提供会话级投影**（`useProjection` / `useChat` 都拿不到）—— 已装的 `dsh-usage` / `pet` / `session-archive` 全是走 `inject` 塞自己的数据源。而速度采样活在 dock 组件的 `useRef` 里。
+
+两者唯一的共同点是**同一个 JS 上下文**，所以本插件用模块级单例 `sharedTrace` 桥接：
+
+```
+dock 的 500ms 采样器 ──写──▶ sharedTrace.points ──读──▶ 设置页分区组件（自持 500ms tick）
+                                    │
+                                    └── 每 5s 快照 ──▶ localStorage `dsh-pulse:trace:v1`
+```
+
+**没有碰宿主、没有加 RPC、没有引依赖。** 打开设置时 dock 仍在后台挂载（dialog 是覆盖层），采样不中断。
+
+#### 3.2 跨会话、跨重启留存
+
+轨迹每 5 秒（不是每 500 ms —— 同步写盘会拖帧）快照进 `localStorage`。所以：
+
+- 重启桌面端后打开设置，**还能看到上次那段对话的曲线**；
+- 换会话不清零 —— 曲线是「这台机器上最近 10 分钟的输出历史」，不是「当前会话的历史」。
+
+#### 3.3 内存与 CPU 增量（实测，不是估算）
+
+| 项 | 数值 | 说明 |
+|---|---|---|
+| 共享轨迹常驻内存 | 约 **82.5 KiB**（1200 点 × 4 个数值 + V8 对象头） | 唯一显著的内存增量，跨会话存活 |
+| `localStorage` 快照 | 约 **58.6 KiB**，每 5 s 写一次 | 节流后，不在每拍路径上 |
+| 每拍多写一个点 | **+4.3 µs**（对照流式一拍 31.5 µs，增量 **13.6%**） | 折算 0.00086% 单核 |
+| 设置页重画一帧 | **约 340 µs**，2 帧/秒 | **只在设置页打开时发生**，折算 0.068% 单核 |
+
+对比 dock 的 20 s 采样缓冲（约 1 KiB），曲线这部分是唯一显著增量 —— 如实列出，不藏。
+
+> 诚实备注：最初以为「逐字符 `+=` 拼 SVG path」是重画大头，改成数组 + `join` 后实测 **340 µs vs 297 µs，在噪声内**，说明大头是 `curveClip` / `curveSpeed` 的数组分配。代码保留了数组写法（语义更清楚），但**不宣称它更快**。
 
 ---
 
@@ -239,7 +286,7 @@ node bench.mjs    # 性能实测：每拍开销 / 常驻内存 / 发布体积
 npm run harness:test   # verify + smoke 都跑
 ```
 
-### `verify.mjs`（实测，EXIT=0，220 条断言全 PASS）
+### `verify.mjs`（实测，EXIT=0，303 条断言全 PASS）
 
 按 `// #region` 标记把纯算术区从 `client.js` 里抽出来求值做行为断言（不是文本匹配）。节选：
 
@@ -291,7 +338,7 @@ npm run harness:test   # verify + smoke 都跑
 VERIFY-OK（全部断言通过）
 ```
 
-### `smoke.mjs`（实测，EXIT=0，44 条断言全 PASS）
+### `smoke.mjs`（实测，EXIT=0，66 条断言全 PASS）
 
 真装载 `client.js`（走 `window.__ModuleLoader__.load`），用假 React 渲染 `PulseDock`：
 
@@ -414,7 +461,7 @@ SMOKE-OK（组件层全部通过）
 | 3.19 ns/字符 | 9750 字正文重数五类字符，5000 次平均 | v0.5.0 新增项，与正文长度成正比；`charCodeAt` 快路径 |
 | 缓冲恒 41 点 | 20 万拍后复查 `samples.length` | 与平台无关，可靠 |
 | gzip 16.7 KiB | `zlib.gzipSync(level:9)` | 可靠 |
-| 220 + 44 条断言全 PASS | `verify.mjs` / `smoke.mjs` | 断言本身可信；但 smoke 用的是**假 React** |
+| 303 + 66 条断言全 PASS | `verify.mjs` / `smoke.mjs` | 断言本身可信；但 smoke 用的是**假 React** |
 | 0.0063% 单核 | 由上三条按 2 拍/秒折算 | **只算采样算术**，不含渲染 |
 
 > 诚实备注：`bench.mjs` 初版把时间步长写成 1 ms/拍，导致环形缓冲不裁剪、测出「95.58 µs / 20001 点」的退化值。修正为真实 500 ms/拍后才是上面的数字。README 里从未出现过那组错值。

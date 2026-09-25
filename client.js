@@ -798,6 +798,237 @@ var RATE_PRIOR = [0.80, 0.24, 0.30, 0.60, 0.12];
     }
     // #endregion
 
+    // #region trace
+    // 模块级共享轨迹：dock 的会话级采样器**写**，设置页的分区组件**读**。
+    // 为什么必须有这一层：settings.section 拿不到 session 级投影（useProjection / useChat），
+    // 而速度采样活在 dock 组件的 useRef 里 —— 两者唯一的共同点是同一个 JS 上下文。
+    // 所以用模块单例桥接：不碰宿主、不加 RPC、不引依赖。
+    // 本区是纯算术 + 持久化，无 React/DOM 依赖，verify.mjs 按标记抽取做单测 —— 勿改标记。
+
+    var TRACE_KEY = "dsh-pulse:trace:v1";
+    var TRACE_VERSION = 1;
+    var TRACE_CAP = 1200;          // 1200 点 × 500ms = 600s = 10 分钟
+    var TRACE_SAVE_MS = 5000;      // 落盘节流：不跟着 500ms 采样写盘（同步 IO 会拖帧）
+    var CURVE_WINDOW_MS = 600000;  // 图上窗口 = 10 分钟
+    var RATE_SPAN_MS = 2000;       // 每点的速率取 2s 子窗斜率（比相邻两点稳）
+    var RATE_SPAN_MIN_MS = 1000;
+
+    var sharedTrace = { points: [], lastSave: 0, ready: false };
+
+    /**
+     * 一个轨迹点。est / exact 是**该时刻的速率**（tok/s），不是累计值 —— 图直接画它，
+     * 不需要再做差分。null = 那一刻没有输出（图上断开，而不是画成 0）。
+     */
+    function tracePoint(t, est, exact, cache) {
+      return {
+        t: t,
+        est: typeof est === "number" && isFinite(est) && est > 0 ? Math.round(est * 10) / 10 : null,
+        exact: typeof exact === "number" && isFinite(exact) && exact > 0 ? Math.round(exact * 10) / 10 : null,
+        cache: typeof cache === "number" && isFinite(cache) && cache >= 0 ? Math.round(cache * 100) / 100 : null
+      };
+    }
+
+    /** 追加一个点并裁到容量上限（原地改数组，返回同一个数组）。 */
+    function tracePush(points, point, cap) {
+      points.push(point);
+      var over = points.length - cap;
+      if (over > 0) points.splice(0, over);
+      return points;
+    }
+
+    /** 读回持久化轨迹；版本不符 / 结构损坏 / 无 storage → 空数组（绝不抛）。 */
+    function traceLoad(storage) {
+      try {
+        if (!storage || typeof storage.getItem !== "function") return [];
+        var raw = storage.getItem(TRACE_KEY);
+        if (typeof raw !== "string" || raw === "") return [];
+        var parsed = JSON.parse(raw);
+        if (!parsed || parsed.v !== TRACE_VERSION || !Array.isArray(parsed.points)) return [];
+        var out = [];
+        for (var i = 0; i < parsed.points.length && out.length < TRACE_CAP; i += 1) {
+          var p = parsed.points[i];
+          if (!p || typeof p.t !== "number" || !isFinite(p.t)) continue;
+          out.push(tracePoint(p.t, p.est, p.exact, p.cache));
+        }
+        out.sort(function (a, b) { return a.t - b.t; });
+        return out;
+      } catch (e) {
+        return [];
+      }
+    }
+
+    /** 写回轨迹；任何异常（配额 / 被禁 / 无 storage）都吞掉 —— 留存是增强，不是依赖。 */
+    function traceSave(storage, points) {
+      try {
+        if (!storage || typeof storage.setItem !== "function") return false;
+        storage.setItem(TRACE_KEY, JSON.stringify({ v: TRACE_VERSION, points: points }));
+        return true;
+      } catch (e) {
+        return false;
+      }
+    }
+
+    /** 惰性装载共享轨迹（模块加载后只读一次盘）。 */
+    function ensureTrace(storage) {
+      if (sharedTrace.ready) return sharedTrace;
+      sharedTrace.ready = true;
+      sharedTrace.points = traceLoad(storage === undefined ? safeStorage() : storage);
+      return sharedTrace;
+    }
+
+    /** 会话累计缓存命中率（%）。计费输入 = 缓存读取 + 未缓存输入，与 computeView 同口径。 */
+    function cachePercentOf(usage) {
+      if (!usage || typeof usage !== "object") return null;
+      var read = nonNeg(usage.cacheReadTokens);
+      var uncached = nonNeg(usage.uncachedInputTokens);
+      var prompt = read + uncached;
+      if (!(prompt > 0)) return null;
+      return (read / prompt) * 100;
+    }
+
+    /**
+     * 把一个采样点写进共享轨迹。
+     * 速率复用已验证的 windowSlope（2s 子窗）—— 空闲时斜率不可用就留 null，
+     * 图上表现为断开。这是刻意的：把空闲画成 0 会让曲线看起来"一直在跑 0 tok/s"。
+     */
+    function traceRecord(store, now, samples, streaming, cachePercent, storage) {
+      var estSlope = streaming ? windowSlope(samples, now, "est", RATE_SPAN_MS, RATE_SPAN_MIN_MS) : null;
+      var exactSlope = streaming ? null : windowSlope(samples, now, "exact", RATE_SPAN_MS, RATE_SPAN_MIN_MS);
+      var point = tracePoint(
+        now,
+        estSlope === null ? null : estSlope.rate,
+        exactSlope === null ? null : exactSlope.rate,
+        cachePercent
+      );
+      tracePush(store.points, point, TRACE_CAP);
+      if (now - store.lastSave >= TRACE_SAVE_MS) {
+        store.lastSave = now;
+        traceSave(storage === undefined ? safeStorage() : storage, store.points);
+      }
+      return point;
+    }
+    // #endregion
+
+    // #region curve
+    // 曲线纯算术：裁剪 / 取序列 / 轴上限 / SVG path / 统计。无 React/DOM 依赖，
+    // verify.mjs 按标记抽取做单测 —— 勿改标记。
+
+    var CURVE_GAP_MS = 2500; // 相邻点间隔超过这个值 → 断开（空闲不是 0，是「没有」）
+
+    /** 裁到时间窗内。 */
+    function curveClip(points, now, windowMs) {
+      var from = now - windowMs;
+      var out = [];
+      for (var i = 0; i < points.length; i += 1) {
+        var t = points[i].t;
+        if (t >= from && t <= now) out.push(points[i]);
+      }
+      return out;
+    }
+
+    /** 取某条字段的非空点 → [{t, v}]（cache 用）。 */
+    function curveSeries(points, field) {
+      var out = [];
+      for (var i = 0; i < points.length; i += 1) {
+        var v = points[i][field];
+        if (typeof v === "number" && isFinite(v)) out.push({ t: points[i].t, v: v });
+      }
+      return out;
+    }
+
+    /**
+     * 速度序列：结算段优先取 exact，否则取 est，并带上 src 标记。
+     * 两条线用不同线型画（exact 实线 / est 虚线），但共用一条时间轴。
+     */
+    function curveSpeed(points) {
+      var out = [];
+      for (var i = 0; i < points.length; i += 1) {
+        var p = points[i];
+        if (typeof p.exact === "number" && isFinite(p.exact)) out.push({ t: p.t, v: p.exact, src: "exact" });
+        else if (typeof p.est === "number" && isFinite(p.est)) out.push({ t: p.t, v: p.est, src: "estimate" });
+      }
+      return out;
+    }
+
+    /** 按 src 过滤（画不同线型用）。 */
+    function curveFilter(series, src) {
+      var out = [];
+      for (var i = 0; i < series.length; i += 1) {
+        if (series[i].src === src) out.push(series[i]);
+      }
+      return out;
+    }
+
+    /** 轴上限取「好看的整数」：1/2/5 × 10^k，且不小于峰值。 */
+    function niceCeil(value) {
+      if (typeof value !== "number" || !isFinite(value) || value <= 0) return 1;
+      var exp = Math.floor(Math.log(value) / Math.LN10);
+      var base = Math.pow(10, exp);
+      var scaled = value / base;
+      var step = scaled <= 1 ? 1 : scaled <= 2 ? 2 : scaled <= 5 ? 5 : 10;
+      return step * base;
+    }
+
+    function round2(v) {
+      return Math.round(v * 100) / 100;
+    }
+
+    /**
+     * 折成 SVG path 的 d 串。x 按时间线性映射；相邻点时间间隔超过 gapMs 就断开，
+     * 所以空闲期不会被画成一条贴着 0 的假线。返回 "" 表示无点可画。
+     */
+    function curvePath(series, t0, t1, width, height, vMax, gapMs) {
+      if (!series || series.length === 0) return "";
+      var span = t1 - t0;
+      if (!(span > 0) || !(width > 0) || !(height > 0) || !(vMax > 0)) return "";
+      var gap = typeof gapMs === "number" && gapMs > 0 ? gapMs : CURVE_GAP_MS;
+      // 用数组 + join 拼 d 串（而不是逐字符 +=）。诚实说明：bench.mjs 实测这**没有**
+      // 显著变快（340 µs vs 297 µs，在噪声内）—— 重画的大头是 curveClip/curveSpeed
+      // 的数组分配，不是字符串拼接。保留这种写法只是因为语义更清楚，不宣称它更快。
+      var out = [];
+      var prevT = null;
+      for (var i = 0; i < series.length; i += 1) {
+        var x = ((series[i].t - t0) / span) * width;
+        if (x < 0) x = 0;
+        if (x > width) x = width;
+        var v = series[i].v;
+        if (v > vMax) v = vMax;
+        var y = height - (v / vMax) * height;
+        if (prevT === null || series[i].t - prevT > gap) {
+          out.push((out.length === 0 ? "" : " ") + "M" + round2(x) + " " + round2(y));
+        } else {
+          out.push(" L" + round2(x) + " " + round2(y));
+        }
+        prevT = series[i].t;
+      }
+      return out.join("");
+    }
+
+    /** 曲线统计：点数 / 峰值 / 均值（无数据 → count 0，peak/avg 0）。 */
+    function curveStats(series) {
+      var n = series ? series.length : 0;
+      if (n === 0) return { count: 0, peak: 0, avg: 0 };
+      var peak = 0;
+      var sum = 0;
+      for (var i = 0; i < n; i += 1) {
+        var v = series[i].v;
+        if (v > peak) peak = v;
+        sum += v;
+      }
+      return { count: n, peak: peak, avg: sum / n };
+    }
+
+    /** X 轴刻度：从窗口起点到现在的等分点，返回**相对当前**的分钟偏移（负数）。 */
+    function curveTicks(windowMs, count) {
+      var n = typeof count === "number" && count >= 2 ? Math.round(count) : 5;
+      var out = [];
+      for (var i = 0; i < n; i += 1) {
+        out.push(-(windowMs / 60000) * (1 - i / (n - 1)));
+      }
+      return out;
+    }
+    // #endregion
+
     var ZH = {
       "cachehit.pill": "缓存命中 {percent}%",
       "cachehit.title": "会话累计缓存命中 {percent}% ｜ 缓存读取 {read} tok ｜ 未缓存输入 {uncached} tok ｜ 缓存写入 {write} tok ｜ 计费输入 {denominator} tok",
@@ -806,7 +1037,22 @@ var RATE_PRIOR = [0.80, 0.24, 0.30, 0.60, 0.12];
       "tps.idle": "— tok/s",
       "tps.title": "近 {window} 秒平均输出速度 {tps} tok/s（真值：provider 上报 usage 后 sessionStats.decodeTokens 的墙钟斜率）｜ 窗口内输出 {tokens} tok ｜ 实测跨度 {span}s ｜ 采样 {points} 点 ｜ 本步真值 {stepTps} tok/s ｜ 五类标定 {rates} tok/char",
       "tps.titleEst": "近 {window} 秒平均输出速度约 {tps} tok/s（估计：流式进行中，宿主尚未上报 usage）｜ 窗口内估算输出 {tokens} tok ｜ 实测跨度 {span}s ｜ 采样 {points} 点 ｜ 五类标定 {rates} tok/char ｜ 上次结算真值 {stepTps} tok/s",
-      "tps.titleIdle": "近 {window} 秒无输出（会话空闲，或刚进入流式还没采到两点）"
+      "tps.titleIdle": "近 {window} 秒无输出（会话空闲，或刚进入流式还没采到两点）",
+      "curve.title": "输出速度曲线",
+      "curve.heading": "输出速度与缓存命中（最近 {minutes} 分钟）",
+      "curve.empty": "暂无数据 —— 这里的曲线由对话时的实时采样累积而来；发一条消息就会开始画。",
+      "curve.legendSpeed": "输出速度 tok/s（左轴）",
+      "curve.legendEst": "流式估计 ~",
+      "curve.legendExact": "结算真值 ✓",
+      "curve.legendCache": "缓存命中 %（右轴）",
+      "curve.now": "当前",
+      "curve.peak": "峰值",
+      "curve.avg": "均值",
+      "curve.samples": "采样点",
+      "curve.cacheNow": "命中率",
+      "curve.saved": "曲线跨会话、跨重启留存（localStorage {key}，每 {seconds}s 落盘一次）。",
+      "curve.axisSpeed": "tok/s",
+      "curve.axisCache": "命中 %"
     };
     var EN = {
       "cachehit.pill": "Cache hit {percent}%",
@@ -816,7 +1062,22 @@ var RATE_PRIOR = [0.80, 0.24, 0.30, 0.60, 0.12];
       "tps.idle": "— tok/s",
       "tps.title": "Output speed over the last {window}s: {tps} tok/s (exact: wall-clock slope of sessionStats.decodeTokens after the provider reported usage) | {tokens} tok in window | measured span {span}s | {points} samples | last step exact {stepTps} tok/s | per-class rates {rates} tok/char",
       "tps.titleEst": "Output speed over the last {window}s: about {tps} tok/s (estimate: streaming, usage not reported yet) | ~{tokens} tok in window | measured span {span}s | {points} samples | per-class rates {rates} tok/char | last step exact {stepTps} tok/s",
-      "tps.titleIdle": "No output in the last {window}s (idle, or fewer than two samples since streaming began)"
+      "tps.titleIdle": "No output in the last {window}s (idle, or fewer than two samples since streaming began)",
+      "curve.title": "Output speed curve",
+      "curve.heading": "Output speed and cache hit (last {minutes} minutes)",
+      "curve.empty": "No data yet - this curve accumulates from live sampling while you chat; send a message and it starts drawing.",
+      "curve.legendSpeed": "Output speed tok/s (left axis)",
+      "curve.legendEst": "streaming estimate ~",
+      "curve.legendExact": "settled exact ✓",
+      "curve.legendCache": "Cache hit % (right axis)",
+      "curve.now": "now",
+      "curve.peak": "peak",
+      "curve.avg": "avg",
+      "curve.samples": "samples",
+      "curve.cacheNow": "hit rate",
+      "curve.saved": "The curve persists across sessions and restarts (localStorage {key}, flushed every {seconds}s).",
+      "curve.axisSpeed": "tok/s",
+      "curve.axisCache": "hit %"
     };
 
     var ANCHOR_STYLE = {
@@ -1046,6 +1307,9 @@ var RATE_PRIOR = [0.80, 0.24, 0.30, 0.60, 0.12];
           state.lastChars = liveChars(state.partial);
           state.lastUnits = countsUnits(countsNow);
           stepMeter(state, now, exact, countsNow, streaming);
+          // v0.7.0：同一次采样顺手写进模块级共享轨迹 —— 设置页的曲线读的就是这一份。
+          // 不额外开定时器、不额外扫描文本，边际成本只有一次 2s 子窗斜率。
+          traceRecord(ensureTrace(), now, state.samples, streaming, cachePercentOf(state.usage));
           // 值没变就不重渲：空闲时采样照跑（窗要滑动），但一帧都不出。
           var next = displayKey(state, now, streaming);
           if (next !== state.renderedKey) {
@@ -1133,6 +1397,195 @@ var RATE_PRIOR = [0.80, 0.24, 0.30, 0.60, 0.12];
       );
     }
 
+    // ---------------------------------------------------------------------------
+    // v0.7.0 设置页曲线 —— settings.section 分区组件。
+    //
+    // 为什么数据要走模块级共享轨迹：设置页是个 dialog，而 settings.section **不提供
+    // session 级投影**（useProjection / useChat 都拿不到）。已装的 dsh-usage / pet /
+    // session-archive 全是走 inject 塞自己的数据源。而速度采样活在 dock 组件的 useRef
+    // 里 —— 两者唯一的共同点是同一个 JS 上下文，所以用模块单例桥接（见 #region trace）。
+    //
+    // 打开设置时 dock 仍在后台挂载（dialog 是覆盖层），采样不中断；即使没开过会话，
+    // 也能从 localStorage 里读回上次的轨迹 —— 这就是「跨重启留存」。
+    // ---------------------------------------------------------------------------
+
+    var CURVE_W = 760;
+    var CURVE_H = 210;
+    // 已装插件占用的 settings.section order：85 / 110 / 120 / 130 / 150 / 151 / 152。
+    // 取 160 —— 排最后，不挤别人。
+    var CURVE_SECTION_ORDER = 160;
+    var CURVE_PAD_L = 48;
+    var CURVE_PAD_R = 54;
+    var CURVE_PAD_T = 12;
+    var CURVE_PAD_B = 24;
+    var CURVE_COLOR_SPEED = "#4c8dff";
+    var CURVE_COLOR_CACHE = "#f0a020";
+    var CURVE_GRID = "rgba(128,128,128,0.22)";
+    var CURVE_AXIS_TEXT = { fill: "currentColor", opacity: 0.62, fontSize: "10px" };
+
+    /** 与产品 formatTokensPerSecond 同款：≥10 取整，<10 一位小数。 */
+    function curveNum(v) {
+      var r = formatRate(v);
+      return r === null ? "0" : r;
+    }
+
+    function PulseCurveSection(props) {
+      var seat = props && props.t ? props.t : null;
+      var tick = react.useState(0);
+      var setTick = tick[1];
+
+      // 自持 500ms tick：设置页打开时 dock 仍在后台挂载，共享轨迹在长，这里只负责重画。
+      react.useEffect(function () {
+        var id = setInterval(function () {
+          setTick(function (n) { return n + 1; });
+        }, SAMPLE_MS);
+        return function () { clearInterval(id); };
+      }, []);
+
+      var store = ensureTrace();
+      var now = Date.now();
+      var pts = curveClip(store.points, now, CURVE_WINDOW_MS);
+      var speedAll = curveSpeed(pts);
+      var speedEst = curveFilter(speedAll, "estimate");
+      var speedExact = curveFilter(speedAll, "exact");
+      var cache = curveSeries(pts, "cache");
+
+      var plotW = CURVE_W - CURVE_PAD_L - CURVE_PAD_R;
+      var plotH = CURVE_H - CURVE_PAD_T - CURVE_PAD_B;
+      var t0 = now - CURVE_WINDOW_MS;
+      var sStats = curveStats(speedAll);
+      var cStats = curveStats(cache);
+      var vMax = niceCeil(sStats.peak);
+      var shift = "translate(" + CURVE_PAD_L + "," + CURVE_PAD_T + ")";
+      var estPath = curvePath(speedEst, t0, now, plotW, plotH, vMax);
+      var exactPath = curvePath(speedExact, t0, now, plotW, plotH, vMax);
+      var cachePath = curvePath(cache, t0, now, plotW, plotH, 100);
+      var lastCache = cache.length === 0 ? null : cache[cache.length - 1].v;
+      var minutes = String(Math.round(CURVE_WINDOW_MS / 60000));
+
+      var grid = [];
+      var g;
+      for (g = 0; g <= 4; g += 1) {
+        var gy = CURVE_PAD_T + (plotH / 4) * g;
+        grid.push(react.createElement("line", {
+          key: "g" + g,
+          x1: CURVE_PAD_L, y1: gy, x2: CURVE_PAD_L + plotW, y2: gy,
+          stroke: CURVE_GRID, strokeWidth: 1
+        }));
+        grid.push(react.createElement("text", {
+          key: "ly" + g, x: CURVE_PAD_L - 6, y: gy + 3, textAnchor: "end", style: CURVE_AXIS_TEXT
+        }, curveNum(vMax * (1 - g / 4))));
+        grid.push(react.createElement("text", {
+          key: "ry" + g, x: CURVE_PAD_L + plotW + 6, y: gy + 3, textAnchor: "start", style: CURVE_AXIS_TEXT
+        }, String(Math.round(100 * (1 - g / 4)))));
+      }
+
+      var ticks = curveTicks(CURVE_WINDOW_MS, 5);
+      for (var xi = 0; xi < ticks.length; xi += 1) {
+        grid.push(react.createElement("text", {
+          key: "x" + xi,
+          x: CURVE_PAD_L + (plotW * xi) / (ticks.length - 1),
+          y: CURVE_H - 8,
+          textAnchor: xi === 0 ? "start" : (xi === ticks.length - 1 ? "end" : "middle"),
+          style: CURVE_AXIS_TEXT
+        }, ticks[xi] === 0 ? "0" : String(ticks[xi]) + "m"));
+      }
+
+      var svg = react.createElement("svg", {
+        width: "100%",
+        height: String(CURVE_H),
+        viewBox: "0 0 " + CURVE_W + " " + CURVE_H,
+        role: "img",
+        "data-pulse-curve-svg": "1"
+      },
+        react.createElement("g", null, grid),
+        exactPath === "" ? null : react.createElement("path", {
+          d: exactPath, fill: "none", stroke: CURVE_COLOR_SPEED, strokeWidth: 1.6,
+          strokeLinejoin: "round", transform: shift
+        }),
+        estPath === "" ? null : react.createElement("path", {
+          d: estPath, fill: "none", stroke: CURVE_COLOR_SPEED, strokeWidth: 1.6,
+          strokeDasharray: "4 3", strokeLinejoin: "round", opacity: 0.85, transform: shift
+        }),
+        cachePath === "" ? null : react.createElement("path", {
+          d: cachePath, fill: "none", stroke: CURVE_COLOR_CACHE, strokeWidth: 1.4,
+          strokeLinejoin: "round", opacity: 0.9, transform: shift
+        })
+      );
+
+      function stat(label, value, color) {
+        return react.createElement("span", {
+          key: label,
+          style: { display: "inline-flex", alignItems: "baseline", gap: "4px" }
+        },
+          react.createElement("span", { style: { opacity: 0.6, fontSize: "11px" } }, label),
+          react.createElement("span", {
+            style: { fontSize: "12px", fontVariantNumeric: "tabular-nums", color: color || "inherit" }
+          }, value)
+        );
+      }
+
+      function legendDot(color, text, dashed) {
+        return react.createElement("span", {
+          key: text,
+          style: { display: "inline-flex", alignItems: "center", gap: "5px", fontSize: "11px", opacity: 0.8 }
+        },
+          react.createElement("span", {
+            style: {
+              display: "inline-block", width: "14px", height: "0",
+              borderTop: "2px " + (dashed ? "dashed" : "solid") + " " + color
+            }
+          }),
+          text
+        );
+      }
+
+      var statsRow = react.createElement("div", {
+        style: { display: "flex", flexWrap: "wrap", gap: "14px", alignItems: "baseline" }
+      },
+        stat(tr(seat, "curve.peak", {}, "峰值"), curveNum(sStats.peak) + " tok/s", CURVE_COLOR_SPEED),
+        stat(tr(seat, "curve.avg", {}, "均值"), curveNum(sStats.avg) + " tok/s", CURVE_COLOR_SPEED),
+        stat(tr(seat, "curve.samples", {}, "采样点"), String(sStats.count)),
+        stat(tr(seat, "curve.cacheNow", {}, "命中率"),
+          lastCache === null ? "—" : String(Math.round(lastCache * 100) / 100) + "%",
+          CURVE_COLOR_CACHE),
+        stat(tr(seat, "curve.avg", {}, "均值") + "（缓存）",
+          cStats.count === 0 ? "—" : String(Math.round(cStats.avg * 100) / 100) + "%",
+          CURVE_COLOR_CACHE)
+      );
+
+      var legend = react.createElement("div", {
+        style: { display: "flex", flexWrap: "wrap", gap: "14px", alignItems: "center" }
+      },
+        legendDot(CURVE_COLOR_SPEED, tr(seat, "curve.legendEst", {}, "流式估计 ~"), true),
+        legendDot(CURVE_COLOR_SPEED, tr(seat, "curve.legendExact", {}, "结算真值 ✓"), false),
+        legendDot(CURVE_COLOR_CACHE, tr(seat, "curve.legendCache", {}, "缓存命中 %（右轴）"), false)
+      );
+
+      return react.createElement("div", {
+        style: { padding: "10px 2px", display: "flex", flexDirection: "column", gap: "10px" },
+        // 只读探针：外部（CDP / DevTools）靠这几条判定曲线是否真的画出来了。
+        "data-pulse-curve": String(sStats.count),
+        "data-pulse-curve-peak": curveNum(sStats.peak),
+        "data-pulse-curve-avg": curveNum(sStats.avg),
+        "data-pulse-curve-cache": lastCache === null ? "na" : String(Math.round(lastCache * 100) / 100),
+        "data-pulse-curve-src": "settings"
+      },
+        react.createElement("div", { style: { fontSize: "13px", fontWeight: 600 } },
+          tr(seat, "curve.heading", { minutes: minutes }, "输出速度与缓存命中（最近 {minutes} 分钟）")),
+        svg,
+        statsRow,
+        legend,
+        sStats.count === 0
+          ? react.createElement("div", { style: { opacity: 0.7, fontSize: "12px" } },
+              tr(seat, "curve.empty", {}, "暂无数据 —— 这里的曲线由对话时的实时采样累积而来；发一条消息就会开始画。"))
+          : null,
+        react.createElement("div", { style: { opacity: 0.55, fontSize: "11px" } },
+          tr(seat, "curve.saved", { key: TRACE_KEY, seconds: String(TRACE_SAVE_MS / 1000) },
+            "曲线跨会话、跨重启留存（localStorage {key}，每 {seconds}s 落盘一次）。"))
+      );
+    }
+
     function apply(ctx) {
       ctx.effect(
         () => ctx.locale.register(NS, { zh: ZH, en: EN }),
@@ -1171,6 +1624,31 @@ var RATE_PRIOR = [0.80, 0.24, 0.30, 0.60, 0.12];
           PulseDock
         )
       );
+
+      // v0.7.0：设置页分区。拿不到 slots API 或注册抛错 → 静默降级
+      // （设置页少一个分区，不影响宿主，也不影响 dock 的那枚 pill）。
+      ctx.slots.inject("settings.section", function () {
+        try {
+          return ctx.slots.register(
+            {
+              name: "settings.section",
+              id: "dsh-pulse",
+              order: CURVE_SECTION_ORDER,
+              label: function () {
+                try {
+                  return ctx.locale.bind(NS)("curve.title");
+                } catch (e) {
+                  return "输出速度曲线";
+                }
+              },
+              locale: NS
+            },
+            PulseCurveSection
+          );
+        } catch (e) {
+          return function () {};
+        }
+      });
     }
 
     exports.name = "dsh-pulse";
@@ -1216,7 +1694,31 @@ var RATE_PRIOR = [0.80, 0.24, 0.30, 0.60, 0.12];
       ORIGINAL_PRIORITY: ORIGINAL_PRIORITY,
       exactOutputTokens: exactOutputTokens,
       readRate: readRate,
-      PulseDock: PulseDock
+      PulseDock: PulseDock,
+      // v0.7.0 设置页曲线：轨迹缓冲 + 曲线纯算术 + 组件。
+      tracePoint: tracePoint,
+      tracePush: tracePush,
+      traceLoad: traceLoad,
+      traceSave: traceSave,
+      ensureTrace: ensureTrace,
+      cachePercentOf: cachePercentOf,
+      traceRecord: traceRecord,
+      sharedTrace: sharedTrace,
+      curveClip: curveClip,
+      curveSeries: curveSeries,
+      curveSpeed: curveSpeed,
+      curveFilter: curveFilter,
+      niceCeil: niceCeil,
+      curvePath: curvePath,
+      curveStats: curveStats,
+      curveTicks: curveTicks,
+      PulseCurveSection: PulseCurveSection,
+      TRACE_KEY: TRACE_KEY,
+      TRACE_CAP: TRACE_CAP,
+      TRACE_SAVE_MS: TRACE_SAVE_MS,
+      CURVE_WINDOW_MS: CURVE_WINDOW_MS,
+      CURVE_SECTION_ORDER: CURVE_SECTION_ORDER,
+      CURVE_GAP_MS: CURVE_GAP_MS
     };
     return module.exports;
   }
